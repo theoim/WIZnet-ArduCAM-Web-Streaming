@@ -22,6 +22,9 @@ the **WIZnet Pico (RP2040/RP2350)** board combined with the **ArduCAM Quick-Boot
 
 ### **WIZnet Pico (RP2040 / RP2350)**
 
+[WIZnet Pico(RP2040)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2040_based)
+[WIZnet Pico(RP2350)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2350_based)
+
 - Supports **RP2040** and **RP2350** (up to 200 MHz Sys Clock)  
 - Integrated Ethernet chip variants:
   - W5100S / W5500 / W6100 — SPI @ 40 MHz  
@@ -32,6 +35,9 @@ the **WIZnet Pico (RP2040/RP2350)** board combined with the **ArduCAM Quick-Boot
 ---
 
 ### **Arducam Quick-Bootup 3MP DVP Camera for IoT**
+
+[Arducam Quick-Bootup 3MP DVP Camera for IoT](https://www.arducam.com/arducam-quick-bootup-3mp-dvp-camera-for-iot.html)
+
 
 | Specification | Description |
 |----------------|--------------|
