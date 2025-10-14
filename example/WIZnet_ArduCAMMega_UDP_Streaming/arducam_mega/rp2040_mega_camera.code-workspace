@@ -1,0 +1,28 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../../boot/grub"
+		},
+		{
+			"path": "../../pico/pico-sdk"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"arducam.h": "c",
+			"image.pio.h": "c",
+			"gc6153_init.h": "c",
+			"image_gc6153.pio.h": "c",
+			"gc032a_init.h": "c",
+			"image_gc032a.pio.h": "c",
+			"sccb.h": "c",
+			"string.h": "c",
+			"image_mega.pio.h": "c",
+			"arducam_mega.h": "c",
+			"sio.h": "c"
+		}
+	}
+}
