@@ -34,6 +34,30 @@ target_link_libraries(IOLIBRARY_FILES PUBLIC
         hardware_clocks
         )
 
+# lwip
+#
+# Glue that lets lwIP drive the WIZnet chip in MACRAW mode: the chip passes raw
+# Ethernet frames up instead of terminating TCP itself. Only the examples that
+# want a software stack link this; the hardwired-TCP examples do not.
+add_library(LWIP_FILES STATIC)
+
+target_sources(LWIP_FILES PUBLIC
+        ${PORT_DIR}/lwip/w5x00_lwip.c
+        )
+
+target_include_directories(LWIP_FILES PUBLIC
+        ${WIZNET_DIR}/Ethernet
+        ${PORT_DIR}
+        ${PORT_DIR}/lwip
+        )
+
+target_link_libraries(LWIP_FILES PUBLIC
+        ETHERNET_FILES
+        pico_stdlib
+        pico_lwip
+        pico_lwip_nosys
+        )
+
 # timer
 add_library(TIMER_FILES STATIC)
 

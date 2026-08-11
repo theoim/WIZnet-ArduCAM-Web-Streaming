@@ -38,6 +38,7 @@
 
 #include "arducam_mega.h"
 #include "web_page.h"
+#include "logo_png.h"
 
 /* --------------------------------- Config --------------------------------- */
 #define PLL_SYS_KHZ         (200 * 1000)
@@ -49,8 +50,24 @@
 #define HTTP_REQ_BUF_SIZE   1024        /* request line + headers we care about */
 #define TCP_CHUNK_MAX       1460        /* one segment worth per send() call    */
 #define SEND_TIMEOUT_MS     2000        /* no progress for this long -> drop     */
+#define FAIL_STREAK_RECOVER 10          /* failed captures before a sensor reset */
 
 #define MJPEG_BOUNDARY      "wiznetframe"
+
+/*
+ * Printed at boot and reported in the status JSON. Bump it when changing
+ * capture or streaming behaviour, so a measurement can be tied to the build
+ * that produced it.
+ */
+#define FW_BUILD_TAG        "toe " __DATE__ " " __TIME__
+
+/*
+ * Shown in the page header and reported in the status JSON.
+ *
+ * The lwIP example next door serves the same page and the same endpoints; this
+ * is what tells the two apart when both are on screen side by side.
+ */
+#define STACK_NAME          "TOE"
 
 #if _WIZCHIP_ >= W6100
     #define TCP_SOCK_MODE   Sn_MR_TCP4
@@ -106,11 +123,34 @@ static volatile bool  g_streaming    = false;
 static volatile res_t g_resolution   = RES_320X240;
 static uint32_t       g_frame_count  = 0;
 static uint32_t       g_drop_count   = 0;
+static uint32_t       g_fail_streak  = 0;   /* consecutive failed captures */
 
-/* Live metrics, updated once per second from the streaming loop. */
-static uint32_t g_fps_x10    = 0;       /* frames/s * 10, so JSON keeps 1 decimal */
-static uint32_t g_capture_ms = 0;       /* last frame: camera capture time        */
-static uint32_t g_send_ms    = 0;       /* last frame: TCP send time              */
+/*
+ * Live metrics, averaged over a one-second window.
+ *
+ * A frame period is made of three parts, measured separately so the bottleneck
+ * is identifiable rather than guessed:
+ *
+ *   vsync_ms  waiting for the sensor to start the next frame. High values mean
+ *             the frame rate is quantised by the sensor, not by our work.
+ *   read_ms   pulling pixels out of the sensor (PIO + DMA + memcpy).
+ *   send_ms   pushing the JPEG over TCP.
+ *
+ *   1000 / fps  ~=  vsync_ms + read_ms + send_ms
+ */
+static uint32_t g_fps_x10   = 0;        /* frames/s * 10, so JSON keeps 1 decimal */
+static uint32_t g_vsync_ms  = 0;
+static uint32_t g_read_ms   = 0;
+static uint32_t g_send_ms   = 0;
+static uint32_t g_frame_kb  = 0;        /* average JPEG size this window          */
+
+/* Accumulators for the window in progress. */
+static uint32_t        g_win_frames    = 0;
+static uint64_t        g_win_vsync_us  = 0;
+static uint64_t        g_win_read_us   = 0;
+static uint64_t        g_win_send_us   = 0;
+static uint64_t        g_win_bytes     = 0;
+static absolute_time_t g_win_start;
 
 /* --------------------------- Function Prototypes --------------------------- */
 static void        set_clock_khz(void);
@@ -118,7 +158,12 @@ static void        network_init(void);
 
 static const char *res_to_string(res_t res);
 static bool        string_to_res(const char *s, size_t len, res_t *out);
+static bool        parse_query_u32(const char *q, size_t qlen, const char *key,
+                                   uint32_t *out);
 static void        apply_resolution(res_t res);
+
+static void        metrics_reset(void);
+static void        metrics_update(void);
 
 static int32_t     tcp_send_all(uint8_t sn, const uint8_t *buf, uint32_t len);
 static int32_t     send_simple_response(uint8_t sn, const char *status,
@@ -152,6 +197,9 @@ int main(void)
         g_role[i] = SOCK_ROLE_HTTP;
     }
 
+    g_win_start = get_absolute_time();
+
+    printf("Firmware build: " FW_BUILD_TAG "\n");
     printf("HTTP camera server ready\n");
     printf("Open http://%d.%d.%d.%d/ in a browser\n",
            g_net_info.ip[0], g_net_info.ip[1], g_net_info.ip[2], g_net_info.ip[3]);
@@ -224,6 +272,41 @@ static bool string_to_res(const char *s, size_t len, res_t *out)
     return false;
 }
 
+/**
+ * Pull an unsigned decimal value out of a query string, e.g. "div=3&pll=1".
+ * The string is not NUL-terminated - it is a slice of the request line.
+ */
+static bool parse_query_u32(const char *q, size_t qlen, const char *key, uint32_t *out)
+{
+    size_t klen = strlen(key);
+    size_t i;
+
+    for (i = 0; i + klen + 1 <= qlen; i++) {
+        /* Match "key=" at a parameter boundary. */
+        if ((i == 0 || q[i - 1] == '&') &&
+            memcmp(q + i, key, klen) == 0 && q[i + klen] == '=') {
+            size_t   p     = i + klen + 1;
+            uint32_t value = 0;
+            bool     digit = false;
+
+            while (p < qlen && q[p] >= '0' && q[p] <= '9') {
+                value = value * 10u + (uint32_t)(q[p] - '0');
+                digit = true;
+                p++;
+                if (value > 0xFFFFu) {
+                    return false;
+                }
+            }
+            if (!digit) {
+                return false;
+            }
+            *out = value;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void apply_resolution(res_t res)
 {
     if (res == g_resolution) {
@@ -232,6 +315,7 @@ static void apply_resolution(res_t res)
     g_resolution = res;
     arducam_mega.set_frame_size(res);
     sleep_ms(200);                       /* let the sensor settle */
+    metrics_reset();                     /* old window describes the old mode */
     printf("Resolution changed to %s\n", res_to_string(res));
 }
 
@@ -311,15 +395,21 @@ static int32_t send_status_json(uint8_t sn)
     int  n = snprintf(body, sizeof(body),
                       "{\"streaming\":%s,\"res\":\"%s\","
                       "\"frames\":%lu,\"dropped\":%lu,"
-                      "\"fps\":%lu.%lu,\"cap_ms\":%lu,\"send_ms\":%lu}",
+                      "\"fps\":%lu.%lu,\"vsync_ms\":%lu,\"read_ms\":%lu,"
+                      "\"send_ms\":%lu,\"kb\":%lu,"
+                      "\"clk_div\":%u,\"pll_div\":%u,\"stack\":\"" STACK_NAME "\"}",
                       g_streaming ? "true" : "false",
                       res_to_string(g_resolution),
                       (unsigned long)g_frame_count,
                       (unsigned long)g_drop_count,
                       (unsigned long)(g_fps_x10 / 10),
                       (unsigned long)(g_fps_x10 % 10),
-                      (unsigned long)g_capture_ms,
-                      (unsigned long)g_send_ms);
+                      (unsigned long)g_vsync_ms,
+                      (unsigned long)g_read_ms,
+                      (unsigned long)g_send_ms,
+                      (unsigned long)g_frame_kb,
+                      (unsigned)arducam_clk_div,
+                      (unsigned)arducam_pll_div);
     if (n <= 0) {
         return -1;
     }
@@ -338,11 +428,20 @@ static int32_t begin_stream(uint8_t sn)
         "Connection: close\r\n"
         "\r\n";
 
+    /*
+     * Hand the camera over to the newest request rather than refusing it.
+     *
+     * The browser has to reopen the stream whenever the frame size changes -
+     * an MJPEG decoder does not expect the dimensions to change mid-stream -
+     * and the old connection is often still half-open at that moment. Refusing
+     * the new one would leave the page showing a dead stream.
+     */
     if (g_stream_sn >= 0 && g_stream_sn != (int8_t)sn) {
-        static const char busy[] = "Camera already streaming to another client.";
-        send_simple_response(sn, "503 Service Unavailable", "text/plain",
-                             busy, (uint32_t)(sizeof(busy) - 1));
-        return -1;
+        uint8_t old = (uint8_t)g_stream_sn;
+        printf("Stream taken over: socket %u -> %u\n", old, sn);
+        g_role[old - SOCK_HTTP_BASE] = SOCK_ROLE_HTTP;
+        g_stream_sn = -1;
+        disconnect(old);
     }
 
     if (tcp_send_all(sn, (const uint8_t *)stream_hdr,
@@ -360,19 +459,75 @@ static int32_t begin_stream(uint8_t sn)
  * Capture one frame and write it as a multipart part.
  * Called from the main loop while the socket stays in SOCK_ROLE_STREAM.
  */
+/** Discard the window in progress; used when the workload changes. */
+static void metrics_reset(void)
+{
+    g_win_frames   = 0;
+    g_win_vsync_us = 0;
+    g_win_read_us  = 0;
+    g_win_send_us  = 0;
+    g_win_bytes    = 0;
+    g_win_start    = get_absolute_time();
+}
+
+/** Roll the one-second measurement window over into the reported values. */
+static void metrics_update(void)
+{
+    int64_t elapsed_us = absolute_time_diff_us(g_win_start, get_absolute_time());
+
+    if (elapsed_us < 1000000) {
+        return;
+    }
+
+    if (g_win_frames) {
+        g_fps_x10  = (uint32_t)(((uint64_t)g_win_frames * 10000000ULL) /
+                                (uint64_t)elapsed_us);
+        g_vsync_ms = (uint32_t)(g_win_vsync_us / g_win_frames / 1000ULL);
+        g_read_ms  = (uint32_t)(g_win_read_us  / g_win_frames / 1000ULL);
+        g_send_ms  = (uint32_t)(g_win_send_us  / g_win_frames / 1000ULL);
+        g_frame_kb = (uint32_t)(g_win_bytes    / g_win_frames / 1024ULL);
+
+    } else {
+        g_fps_x10 = 0;
+    }
+
+    g_win_frames   = 0;
+    g_win_vsync_us = 0;
+    g_win_read_us  = 0;
+    g_win_send_us  = 0;
+    g_win_bytes    = 0;
+    g_win_start    = get_absolute_time();
+}
+
 static int32_t push_stream_frame(uint8_t sn)
 {
-    uint32_t jpeg_size;
-    int      n;
+    uint32_t        jpeg_size;
+    int             n;
+    absolute_time_t send_start;
 
     if (!g_streaming) {
+        metrics_update();                /* keep the window honest while idle */
         return 1;                        /* connection stays open, no new frames */
     }
 
     if (arducam_mega.get_frame() != 0) {
         g_drop_count++;
+
+        /*
+         * A run of failures means the sensor stopped emitting frames rather
+         * than that one capture went bad - typically a clock setting it could
+         * not take. Reset it instead of spinning on a dead sensor.
+         */
+        if (++g_fail_streak >= FAIL_STREAK_RECOVER) {
+            printf("No frames for %u attempts - recovering sensor\n",
+                   (unsigned)g_fail_streak);
+            arducam_recover();
+            g_fail_streak = 0;
+            metrics_reset();
+        }
         return 1;
     }
+    g_fail_streak = 0;
 
     jpeg_size = arducam_mega.frame.frame_length;
 
@@ -392,6 +547,8 @@ static int32_t push_stream_frame(uint8_t sn)
         return -1;
     }
 
+    send_start = get_absolute_time();
+
     if (tcp_send_all(sn, (const uint8_t *)g_tx_hdr, (uint32_t)n) < 0) {
         return -1;
     }
@@ -403,6 +560,14 @@ static int32_t push_stream_frame(uint8_t sn)
     }
 
     g_frame_count++;
+
+    g_win_frames++;
+    g_win_vsync_us += arducam_vsync_wait_us;
+    g_win_read_us  += arducam_readout_us;
+    g_win_send_us  += (uint64_t)absolute_time_diff_us(send_start, get_absolute_time());
+    g_win_bytes    += jpeg_size;
+    metrics_update();
+
     return 1;
 }
 
@@ -425,7 +590,32 @@ static int32_t http_route(uint8_t sn, const char *path, size_t path_len)
                                     (uint32_t)(sizeof(HTTP_INDEX_PAGE) - 1));
     }
 
-    if (path_len == 7 && memcmp(path, "/stream", 7) == 0) {
+    /*
+     * The logo is the one asset the page pulls in. Unlike the status responses
+     * it never changes, so let the browser keep it rather than refetch 35 KB
+     * on every reload.
+     */
+    if (path_len == 9 && memcmp(path, "/logo.png", 9) == 0) {
+        int n = snprintf(g_tx_hdr, sizeof(g_tx_hdr),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: image/png\r\n"
+                         "Content-Length: %lu\r\n"
+                         "Cache-Control: max-age=86400\r\n"
+                         "Connection: close\r\n"
+                         "\r\n",
+                         (unsigned long)sizeof(LOGO_PNG));
+        if (n <= 0) {
+            return -1;
+        }
+        if (tcp_send_all(sn, (const uint8_t *)g_tx_hdr, (uint32_t)n) < 0) {
+            return -1;
+        }
+        return tcp_send_all(sn, LOGO_PNG, (uint32_t)sizeof(LOGO_PNG));
+    }
+
+    /* The page appends a counter to force the browser to reopen the stream. */
+    if (path_len >= 7 && memcmp(path, "/stream", 7) == 0 &&
+        (path_len == 7 || path[7] == '?')) {
         return begin_stream(sn);
     }
 
@@ -433,6 +623,7 @@ static int32_t http_route(uint8_t sn, const char *path, size_t path_len)
         g_streaming   = true;
         g_frame_count = 0;
         g_drop_count  = 0;
+        metrics_reset();
         printf("Streaming STARTED\n");
         return send_status_json(sn);
     }
@@ -448,11 +639,40 @@ static int32_t http_route(uint8_t sn, const char *path, size_t path_len)
         return send_status_json(sn);
     }
 
+    if (path_len == 10 && memcmp(path, "/api/reset", 10) == 0) {
+        arducam_recover();
+        g_fail_streak = 0;
+        metrics_reset();
+        return send_status_json(sn);
+    }
+
     /* /api/res?v=<WxH> */
     if (path_len > 11 && memcmp(path, "/api/res?v=", 11) == 0) {
         res_t res;
         if (string_to_res(path + 11, path_len - 11, &res)) {
             apply_resolution(res);
+        }
+        return send_status_json(sn);
+    }
+
+    /*
+     * /api/clk?div=<n>&pll=<n>
+     *
+     * Sweep the sensor clock dividers without reflashing. Frame rate is set
+     * almost entirely by how fast the sensor emits a frame, so this is the
+     * knob worth searching. Once a good pair is found for each resolution,
+     * fold the values into set_framesize().
+     */
+    if (path_len > 9 && memcmp(path, "/api/clk?", 9) == 0) {
+        const char *q   = path + 9;
+        size_t      qlen = path_len - 9;
+        uint32_t    div, pll;
+
+        if (parse_query_u32(q, qlen, "div", &div) &&
+            parse_query_u32(q, qlen, "pll", &pll) &&
+            div <= 0xFF && pll <= 0xFF) {
+            arducam_set_clock_div((uint8_t)div, (uint8_t)pll);
+            metrics_reset();
         }
         return send_status_json(sn);
     }

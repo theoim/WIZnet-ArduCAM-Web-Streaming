@@ -1,4 +1,4 @@
-set(TARGET_NAME tcpweb_streaming)
+set(TARGET_NAME toe_web_streaming)
 
 add_executable(${TARGET_NAME}
         main.c

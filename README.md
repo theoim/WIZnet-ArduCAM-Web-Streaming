@@ -1,180 +1,163 @@
-# ArduCAM × WIZnet Pico — High-Speed JPEG Streaming over Ethernet
+# WIZnet ArduCAM Web Streaming
 
-### Real-time embedded camera streaming using RP2040/RP2350 and ArduCAM DVP
+Real-time JPEG video from an **ArduCAM Quick-Bootup 3MP DVP camera** over Ethernet,
+on a **WIZnet Pico (RP2040 / RP2350)** board.
 
----
+Three examples, one camera driver:
 
-## 🧩 Project Overview
+| Example | Transport | Viewer | Network stack |
+|---|---|---|---|
+| [`WIZnet_ArduCAMMega_TOE_Web_Streaming`](example/WIZnet_ArduCAMMega_TOE_Web_Streaming) | HTTP / MJPEG | **Any browser** | Hardwired TCP/IP in the WIZnet chip |
+| [`WIZnet_ArduCAMMega_Lwip_Web_Streaming`](example/WIZnet_ArduCAMMega_Lwip_Web_Streaming) | HTTP / MJPEG | **Any browser** | lwIP in software on the MCU |
+| [`WIZnet_ArduCAMMega_UDP_Streaming`](example/WIZnet_ArduCAMMega_UDP_Streaming) | Raw UDP | Python + OpenCV | Hardwired UDP sockets |
 
-This project demonstrates a **real-time Ethernet-based JPEG streaming system** built using  
-the **WIZnet Pico (RP2040/RP2350)** board combined with the **ArduCAM Quick-Bootup 3MP DVP Camera**.
-
-### System Flow
-- **Camera (Pico):** Captures JPEG frames via 8-bit DVP → splits → sends via UDP.  
-- **PC (Python):** Receives packets → reassembles → decodes → displays in real time using OpenCV.
-
-> 🧠 **Core Keywords:**  
-> RP2040 DVP PIO DMA / UDP JPEG Streaming / Frame Reassembly / OpenCV Real-Time Decoding
-
----
-
-## ⚙️ Hardware Modules
-
-### **WIZnet Pico (RP2040 / RP2350)**
-
-[WIZnet Pico(RP2040)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2040_based)
-[WIZnet Pico(RP2350)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2350_based)
-
-- Supports **RP2040** and **RP2350** (up to 200 MHz Sys Clock)  
-- Integrated Ethernet chip variants:
-  - W5100S / W5500 / W6100 — SPI @ 40 MHz  
-  - W6300 — QSPI Quad @ 37.5 MHz  
-- Fully compatible with **Pico SDK 1.5.1**  
-- Supports concurrent **DVP Camera + Ethernet + SPI Flash + UART**
+The two web examples are byte-for-byte the same UI and the same capture path. The only
+difference is where TCP is terminated — which makes them a direct, side-by-side
+measurement of what a hardwired TCP/IP stack buys you. See
+[Comparing the two](#comparing-the-two).
 
 ---
 
-### **Arducam Quick-Bootup 3MP DVP Camera for IoT**
+## Hardware
 
-[Arducam Quick-Bootup 3MP DVP Camera for IoT](https://www.arducam.com/arducam-quick-bootup-3mp-dvp-camera-for-iot.html)
+### WIZnet Pico (RP2040 / RP2350)
 
+- [WIZnet Pico (RP2040)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2040_based)
+- [WIZnet Pico (RP2350)](https://docs.wiznet.io/Product/Modules/Open-Source-Hardware/rp2350_based)
 
-| Specification | Description |
-|----------------|--------------|
-| **Sensor** | 3MP Mega DVP Color (2048×1536) |
-| **Lens** | 88° FOV, Fixed Focus, F/2.0 |
-| **Output Format** | JPEG / YUV / RGB |
-| **Boot Speed** | 300 ms Instant Boot |
-| **Power** | Idle Off / 300 ms Wake-up |
-| **Size** | 12.9 × 17 × 5.3 mm |
-| **Compatible MCUs** | RP2040, Arduino, STM32, ESP32, Renesas, etc. |
-| **Max Frame Rate** | 2048×1536 @ 12 fps |
+| | |
+|---|---|
+| System clock | 200 MHz |
+| Ethernet | W5100S / W5500 / W6100 (SPI 40 MHz), **W6300 (QSPI Quad 37.5 MHz)** |
+| Concurrent | DVP camera + Ethernet + SPI flash + UART |
 
-> 💡 *Instant-on (300 ms) and low-power design — ideal for IoT vision projects requiring fast response.*
+Measurements below were taken on **W6300 in QSPI Quad mode**.
 
----
+### Arducam Quick-Bootup 3MP DVP Camera for IoT
 
-## 🚀 Performance (Sys Clock 200 MHz)
+[Product page](https://www.arducam.com/arducam-quick-bootup-3mp-dvp-camera-for-iot.html)
 
-| MCU Module | Ethernet Interface | 1280×720 (HD) | 1920×1080 (FHD) |
-|-------------|--------------------|---------------|-----------------|
-| W5100S / W5500 / W6100 | SPI 40 MHz | 10 – 17 fps | 2 – 6 fps |
-| W6300 | QSPI Quad 37.5 MHz | 22 – 30 fps | 6 – 8 fps |
+| Specification | Value |
+|---|---|
+| Sensor | 3MP Mega DVP colour (2048 × 1536) |
+| Lens | 88° FOV, fixed focus, F/2.0 |
+| Output | JPEG / YUV / RGB |
+| Boot | 300 ms |
+| Size | 12.9 × 17 × 5.3 mm |
 
-> ✅ The **W6300 QSPI Pico** delivers smooth HD streaming with stable real-time transfer.
+### Pin mapping
 
----
-
-## 📡 Pin Mapping (Pico ↔ ArduCAM)
-
-| Pico Pin | ArduCAM Pin | Function |
-|-----------|--------------|-----------|
-| GP00 | SDA | SCCB (I2C Data) |
-| GP01 | SCL | SCCB (I2C Clock) |
-| GP04 | VSYNC | Frame Sync |
-| GP05–GP12 | D0–D7 | 8-bit Pixel Data |
-| GP13 | PCLK | Pixel Clock |
-| GP14 | HREF | Line Sync |
+| Pico | ArduCAM | Function |
+|---|---|---|
+| GP00 | SDA | SCCB (I2C data) |
+| GP01 | SCL | SCCB (I2C clock) |
+| GP04 | VSYNC | Frame sync |
+| GP05–GP12 | D0–D7 | 8-bit pixel data |
+| GP13 | PCLK | Pixel clock |
+| GP14 | HREF | Line sync |
 | VCC / GND | — | 3.3 V / GND |
 
-> Each **PCLK rising edge** samples one pixel (8 bit).  
-> **VSYNC HIGH** defines the active frame duration.
+Each rising PCLK edge, qualified by HREF, samples one byte. VSYNC high marks the
+active frame.
 
 ---
 
-## 🎞️ JPEG Capture Sequence (PIO + DMA)
-① VSYNC ↑ → Frame Start
-② HSYNC ↑ → New Line Start
-③ PCLK ↑ → Sample D0–D7
-④ DMA stores 32-bit chunks to buffer
-⑤ HSYNC ↓ → Line End
-⑥ VSYNC ↓ → Frame End
+## Measured performance
 
-- PIO handles signal timing.  
-- DMA transfers 32-bit blocks (512 B each) to RAM.  
-- If the JPEG SOI (0xFFD8) isn’t detected in the first 4 lines, capture is retried.
+W6300 QSPI, 200 MHz, TOE example, one browser client. `read` is the time spent
+pulling pixels out of the sensor; `frame` is the JPEG size.
+
+| Resolution | CLK_DIV | fps | read | frame |
+|---|---|---|---|---|
+| 320 × 240 | 2 | 7 | 59 ms | 9 KB |
+| 640 × 480 | 1 | 12.5 | 29 ms | 24 KB |
+| **1280 × 720** | **1** | **22 – 29** | **22 ms** | 47 KB |
+| 1600 × 1200 | 2 | 3.7 | 122 ms | 100 KB |
+| 1920 × 1080 | 2 | 7.5 | 68 ms | 88 KB |
+
+Two things surprise people here, and both are the sensor rather than the MCU:
+
+- **720p is the fast mode.** It is neither the largest nor the smallest frame, but it
+  is the one the sensor reads out quickest. Lower resolutions go through the full
+  readout plus a downscaler, so they are not faster.
+- **1080p beats 1600×1200** despite having more pixels, because 16:9 is a crop of the
+  sensor while 4:3 reads the whole array. You can see the field of view narrow when
+  you switch to it.
+
+The sensor clock divider is set per resolution in `set_framesize()` — a single shared
+value leaves most modes running at half speed, and the fastest value corrupts the
+high-resolution modes. The web UI exposes the divider live so it can be re-tuned on
+different hardware.
 
 ---
 
-## 📤 UDP Streaming Protocol
+## Comparing the two
 
-Because JPEG sizes vary (a few KB ~ tens of KB), frames are split into multiple UDP packets.  
-Each packet includes a 4-byte header.
+Flash one board with each web example and open both pages side by side. They use
+different addresses so they can share a network:
 
-| Byte | Field | Description |
-|------|--------|-------------|
-| [0] | Frame ID | Frame identifier |
-| [1] | Packet ID | Sequence within frame |
-| [2] | Total Packets | Total count |
-| [3] | End Flag | 0x01 = last packet |
-| [4 ~] | JPEG Data | Partial image data |
+| | TOE | lwIP |
+|---|---|---|
+| Address | `192.168.11.3` | `192.168.11.5` |
+| Header badge | **TOE**, red | **lwIP**, charcoal |
+| Socket mode | `Sn_MR_TCP4` | `Sn_MR_MACRAW` |
+| TCP terminated by | The WIZnet chip | The MCU, in lwIP |
+
+Both pages show the same two fixed-scale charts — frame rate (0–30 fps) and link
+throughput (0–10 Mbps) — so the lines can be read against each other directly.
+
+The interesting part is what happens during a capture. `arducam_capture_frame()`
+blocks for 22–120 ms depending on resolution. With the hardwired stack the chip keeps
+acknowledging and buffering throughout; with lwIP the MCU *is* the stack, so for that
+whole window nothing is acknowledged, no timer runs, and the receive buffer just
+fills. That difference is what the charts make visible.
 
 ---
 
-### **Sender (Pico)**
+## Build
 
-```c
-total_packets = (jpeg_size + PAYLOAD_SIZE - 1) / PAYLOAD_SIZE;
-
-for (pkt_id = 0; pkt_id < total_packets; pkt_id++) {
-    tx_packet[0] = frame_id;
-    tx_packet[1] = pkt_id;
-    tx_packet[2] = total_packets;
-    tx_packet[3] = (pkt_id == total_packets - 1) ? 0x01 : 0x00;
-
-    memcpy(tx_packet + 4, jpeg_data + offset, chunk_size);
-    sendto(socket, tx_packet, chunk_size + 4, destip, destport);
-}
-```
-Receiver (Python)
-
-```python
-fid, pid, tot = pkt[0], pkt[1], pkt[2]
-self.buf.setdefault(fid, {})[pid] = pkt[4:]
-if len(self.buf[fid]) == tot:
-    data = b"".join(self.buf[fid][i] for i in range(tot))
-    return data  # Reconstructed JPEG frame
-
-- The Assembler class reassembles packets by Frame ID and Packet ID.
-
-- OpenCV decodes and displays frames in real time.
-```
-
-### 🧠 Key Advantages
-Feature	Description
-⚡ Ultra-Low Latency	Real-time 1-frame streaming via UDP + PIO + DMA
-🧩 Modular Design	Camera, network, and viewer are fully decoupled
-💡 Customizable	Adjust JPEG quality, resolution, and frame rate
-🧠 Scalable	Ideal for IoT vision, robotics, and inspection systems
-🪄 Summary
-
-Real-time JPEG streaming using ArduCAM + WIZnet Pico.
-Capture via DVP, stream over UDP, and decode live with Python OpenCV.
-
-### 🧩 Requirements
-
-
-Pico SDK 1.5.1+
-
-Python 3.9+
-
-OpenCV 4.8+
-
-NumPy, Pillow, Tkinter
-
-WIZnet Ethernet-enabled Pico (W5100S/W5500/W6100/W6300)
-
-### 🔧 Build & Run
-Pico Firmware
+Requires the Pico SDK (vendored in `libraries/pico-sdk`) and an ARM GCC toolchain.
 
 ```bash
-cd firmware
-mkdir build && cd build
-cmake ..
-make -j
+git clone --recurse-submodules https://github.com/theoim/WIZnet-ArduCAM-Web-Streaming.git
+cd WIZnet-ArduCAM-Web-Streaming
+cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
 ```
-Python Viewer
-```bash
-cd viewer
-python stream_viewer.py
+
+Artifacts:
+
 ```
+build/example/WIZnet_ArduCAMMega_TOE_Web_Streaming/toe_web_streaming.uf2
+build/example/WIZnet_ArduCAMMega_Lwip_Web_Streaming/lwip_web_streaming.uf2
+build/example/WIZnet_ArduCAMMega_UDP_Streaming/main.uf2
+```
+
+Hold BOOTSEL, plug in the board, copy the `.uf2` across.
+
+Set the target chip and interface in the top-level `CMakeLists.txt`
+(`WIZNET_CHIP`, `_WIZCHIP_QSPI_MODE_`).
+
+---
+
+## Repository layout
+
+```
+example/
+├─ WIZnet_ArduCAMMega_TOE_Web_Streaming/    HTTP + MJPEG, hardwired TCP/IP
+│  ├─ arducam_mega/                          camera driver (shared)
+│  ├─ web_page.h                             the UI, embedded
+│  └─ logo_png.h                             logo, embedded
+├─ WIZnet_ArduCAMMega_Lwip_Web_Streaming/   HTTP + MJPEG, lwIP
+└─ WIZnet_ArduCAMMega_UDP_Streaming/        raw UDP, Python viewer
+libraries/
+├─ ioLibrary_Driver/                         WIZnet chip driver
+└─ pico-sdk/
+port/
+├─ ioLibrary_Driver/                         SPI/QSPI transport
+└─ lwip/                                     MACRAW glue + lwipopts.h
+```
+
+The lwIP example deliberately compiles the camera driver from the TOE example's
+directory rather than keeping its own copy. The two demos have to capture
+identically, or the comparison measures the wrong thing.

@@ -1,0 +1,18 @@
+# CMake build tree
+build/
+cmake-build-*/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Python viewer
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+Thumbs.db
+.DS_Store
