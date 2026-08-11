@@ -1,1 +1,2 @@
 add_subdirectory(WIZnet_ArduCAMMega_UDP_Streaming)
+add_subdirectory(WIZnet_ArduCAMMega_TCPWeb_Streaming)
