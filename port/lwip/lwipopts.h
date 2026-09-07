@@ -45,6 +45,24 @@
 #define LWIP_TCP 1
 #define MEM_SIZE 16384
 
+/*
+ * Connection turnover, sized for a browser talking to a camera.
+ *
+ * A page load opens six connections at once (the page, the logo, the favicon,
+ * the control list, the first status poll and the stream) and every one of them
+ * is Connection: close. With the stock TCP_MSL of 60 s each finished connection
+ * holds a pcb in TIME_WAIT for 2*MSL - two minutes - against a pool of five.
+ * The observable result on the ArduCAM exhibition build was a device that
+ * needed several minutes after boot before it would hold a stream at all, and
+ * then ran fine: the pool was full of connections that had been closed since
+ * the page loaded.
+ *
+ * 5 s of TIME_WAIT is ample on a local link where the round trip is under a
+ * millisecond, and ten pcbs cost about 2 KB.
+ */
+#define TCP_MSL             5000
+#define MEMP_NUM_TCP_PCB    10
+
 // disable ACD to avoid build errors
 // http://lwip.100.n7.nabble.com/Build-issue-if-LWIP-DHCP-is-set-to-0-td33280.html
 #define LWIP_DHCP_DOES_ACD_CHECK 0
@@ -56,9 +74,76 @@
 #define LWIP_NETIF_STATUS_CALLBACK 1
 
 #define TCP_MSS (1500 /*mtu*/ - 20 /*iphdr*/ - 20 /*tcphhr*/)
+/*
+ * The send window, and the reason a 47 KB frame took 94 ms to be acknowledged.
+ *
+ * At 8 MSS only 11.6 KB can be unacknowledged at once, so a 720p JPEG has to
+ * fill and drain that window four times over - four round trips, plus whatever
+ * the peer's delayed-ACK timer adds to each. Measured on the exhibition build:
+ * VSYNC 18 + readout 22 + send 11 + ACK wait 94 ms. Two thirds of the frame
+ * period spent waiting rather than working, with lwIP's retransmit timer firing
+ * on top of it - the capture shows spurious retransmissions.
+ *
+ * 16 MSS puts 23 KB in flight, half a frame, which halves the round trips.
+ * Nothing here holds payload: the JPEG stays in image_buff and goes out without
+ * TCP_WRITE_FLAG_COPY.
+ */
+/* REVERTED to 8. Raising this to 16 was tried and measured worse - ACK wait
+   went from 94 ms to 1492 ms and the frame rate from 7.9 to 0.9 fps - which is
+   the clue that the constraint is on the receive side, not the send side. A
+   bigger window puts more data in flight, which brings more ACKs back, which
+   starves the receive path faster. See PBUF_POOL_SIZE below. */
 #define TCP_SND_BUF     (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN (4 * TCP_SND_BUF / TCP_MSS)   /* = 32 */
-#define MEMP_NUM_TCP_SEG (TCP_SND_QUEUELEN + 4)         /* must be >= TCP_SND_QUEUELEN */
+/*
+ * Global, and it has to leave room for something other than the stream.
+ *
+ * TCP_SND_QUEUELEN is per-pcb; this pool is shared. A 720p JPEG is about 46 KB,
+ * which at one MSS per write is 33 segments - so one frame in flight took 33 of
+ * the 36 there used to be, and lwIP then had nothing left to build a SYN,ACK
+ * with. A packet capture showed exactly that: the browser's SYNs retransmitting
+ * unanswered while the stream ran at full rate, and connecting fine in the gaps
+ * between frames.
+ *
+ * MEMP_NUM_PBUF is the matching limit on the other side of the same write: the
+ * JPEG goes out without TCP_WRITE_FLAG_COPY, so every tcp_write() takes a
+ * PBUF_ROM pbuf from this pool, and the stock 16 cannot describe a 33-chunk
+ * frame at all.
+ *
+ * Both are small structs - a few hundred bytes each at these counts - because
+ * neither owns payload. The payload stays in image_buff.
+ */
+/* Sized above TCP_SND_QUEUELEN (now 64) rather than at it, so that filling the
+   stream window still leaves segments for a SYN,ACK and for the status poll. */
+#define MEMP_NUM_TCP_SEG 96
+#define MEMP_NUM_PBUF    96
+
+/*
+ * The receive path, and where the retransmissions were coming from.
+ *
+ * Every Ethernet frame the MACRAW socket hands up takes a pbuf from this pool -
+ * net_service() calls pbuf_alloc(PBUF_RAW, len, PBUF_POOL) - and when the pool
+ * is empty it gives up and leaves the data in the chip. What gets dropped that
+ * way is mostly ACKs, so lwIP never learns that the peer received the frame and
+ * its retransmit timer fires: the capture shows the device sending spurious
+ * retransmissions of data the PC had already acknowledged.
+ *
+ * Unlike the two pools above this one owns payload - about 1.5 KB each - so 32
+ * costs roughly 24 KB. That is the price of not dropping acknowledgements while
+ * a 47 KB frame is going out.
+ */
+#define PBUF_POOL_SIZE   32
+
+/*
+ * Pool accounting. Small counters, and the only way to answer "which pool ran
+ * out" without guessing - which on this example has been the expensive way to
+ * answer anything.
+ */
+#define LWIP_STATS       1
+#define MEMP_STATS       1
+#define MEM_STATS        1
+#define LINK_STATS       1
+#define LWIP_STATS_DISPLAY 0
 
 #define LWIP_HTTPD_CGI 0
 #define LWIP_HTTPD_SSI 0

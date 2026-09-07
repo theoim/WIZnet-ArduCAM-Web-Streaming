@@ -1,6 +1,7 @@
 # CMake build tree
 build/
 cmake-build-*/
+build*/
 
 # Editor / IDE
 .vscode/
