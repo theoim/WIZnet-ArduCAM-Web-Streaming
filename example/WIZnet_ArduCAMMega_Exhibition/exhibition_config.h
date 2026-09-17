@@ -99,6 +99,39 @@
 #define EXHIBITION_AUTOSTART 1
 #endif
 
+/* ----------------------------------- UI ------------------------------------ */
+/*
+ * Strip the page down to what a visitor walking past actually needs.
+ *
+ * The full page was built on a 1440p desk monitor and assumes a sidebar. The
+ * show laptop is lower resolution, and on it the control column pushes the
+ * picture down until the graphs fall below the fold - so the one thing the
+ * exhibit is about, the stream degrading under load, is off screen.
+ *
+ * At 1 the page is: logo, stack badge, picture edge to edge, then the two
+ * graphs. Everything a visitor cannot use is hidden, which is everything that
+ * needs a decision:
+ *
+ *   - START / STOP        the board autostarts (EXHIBITION_AUTOSTART) and
+ *                         nobody should be able to stop it mid-visit
+ *   - Resolution          set once before the doors open
+ *   - Link load           the load generator; see the note below
+ *   - CLK_DIV / PLL_DIV   bring-up controls, not exhibit controls
+ *   - Sensor controls     already off by default (EXHIBITION_SENSOR_CONTROLS)
+ *
+ * The markup and the script are untouched - the elements are still there and
+ * still driven, they are just not painted. That keeps one page for both modes
+ * and means switching back is this one line, not a merge.
+ *
+ * NOTE: hiding Link load hides the comparison the exhibit was built around.
+ * With it off the visitor sees one stack running clean, not the TOE holding up
+ * while lwIP gives way. If the load is meant to be part of the demo, either
+ * set this to 0 or drive the load from the host instead of the page.
+ */
+#ifndef EXHIBITION_SIMPLE_UI
+#define EXHIBITION_SIMPLE_UI 1
+#endif
+
 #define FAIL_STREAK_RECOVER 10          /* failed captures before a sensor reset */
 #define MJPEG_BOUNDARY      "wiznetframe"
 

@@ -33,6 +33,11 @@
 #ifndef WEB_PAGE_H
 #define WEB_PAGE_H
 
+/* EXHIBITION_SIMPLE_UI lives here. The page is one C string, so the switch
+   is applied by the preprocessor between adjacent string literals: the block
+   it guards simply is not part of the string in the other mode. */
+#include "exhibition_config.h"
+
 static const char HTTP_INDEX_PAGE[] =
 "<!DOCTYPE html>\n"
 "<html lang='en'>\n"
@@ -127,6 +132,27 @@ static const char HTTP_INDEX_PAGE[] =
 ".seg button.on{background:var(--load);border-color:var(--load);\n"
 "  color:#ffffff;font-weight:700}\n"
 
+/* --- Resolution bar. Built like the load row rather than as a <select>:
+       a dropdown hides four of the five choices until it is opened, and a
+       visitor who has to open something first will not touch it at all.
+       Named by mode (HD, FHD) rather than by pixels - "1280 x 720" is a
+       number to decode, "HD" is already understood. --- */
+".resseg{display:flex;gap:0}\n"
+".resseg button{flex:1;border:1px solid var(--line);background:transparent;\n"
+"  color:var(--muted);border-radius:0;font-weight:700;padding:10px 0;\n"
+"  letter-spacing:1px}\n"
+".resseg button:first-child{border-radius:7px 0 0 7px}\n"
+".resseg button:last-child{border-radius:0 7px 7px 0}\n"
+".resseg button+button{border-left:0}\n"
+".resseg button small{font-size:.72em;font-weight:600;opacity:.75;\n"
+"  letter-spacing:0}\n"
+".resseg button.on{background:var(--stack);border-color:var(--stack);\n"
+"  color:#ffffff}\n"
+
+/* The mode shown over the picture. Hidden in the full UI, where the same
+   value is already a row in the definition list beside it. */
+".resnow{display:none}\n"
+
 "select{width:100%;padding:8px;border-radius:7px;border:1px solid var(--line);\n"
 "  background:var(--bg);color:var(--text);font-size:13px}\n"
 "label{display:block;font-size:11px;color:var(--muted);margin:0 0 5px}\n"
@@ -154,6 +180,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  color:var(--muted)}\n"
 ".chead .stats b{color:var(--text);font-variant-numeric:tabular-nums}\n"
 ".chead .stats b.load{color:var(--load)}\n"
+".legend i.sram{background:var(--muted)}\n"
 "canvas{display:block;width:100%;height:180px}\n"
 ".legend{display:flex;flex-wrap:wrap;gap:20px;margin-top:10px;\n"
 "  font-size:13px;color:var(--muted)}\n"
@@ -187,6 +214,117 @@ static const char HTTP_INDEX_PAGE[] =
 ".row input[type=range]{margin:0}\n"
 ".row input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;\n"
 "  cursor:pointer}\n"
+
+/* ------------------------- Simplified exhibition UI -------------------------
+
+   Same markup, same script. Only what gets painted changes, so switching back
+   is one #define and not a merge.
+
+   Written for the show laptop, which is lower resolution than the monitor the
+   full page was built on. The rule that drives every number below: the picture
+   and both graphs must be on screen together without scrolling, because the
+   exhibit is the relationship between them - the stream rate falling is only
+   worth anything if the picture stuttering is visible at the same moment.
+
+   The picture is not given a size. It is given whatever is left after the
+   header and the graph row have taken theirs, which is the only version of
+   this that survives an unknown laptop: no vh guess to retune, and a banner
+   appearing pushes the picture down by its own height instead of off the
+   bottom of the screen.
+
+   A 16:9 frame at the full width of a 1366-wide screen is 760px tall - the
+   whole screen - so on a short screen it is the height that binds and the
+   frame sits in a black box with bars either side. The box is black, so the
+   bars read as the edge of the screen rather than as empty page. --------- */
+#if EXHIBITION_SIMPLE_UI
+/* One screen, laid out top to bottom: header, picture, graphs. The picture
+   is the flexible row, so it absorbs the slack and nothing else has to be
+   measured. min-height stops it collapsing to nothing on a very short
+   window - past that point the page scrolls, which is the right failure. */
+"body{min-height:100vh;display:flex;flex-direction:column}\n"
+/* margin:0 matters. The base rule centres main with "margin:0 auto", and an
+   auto margin on a stretched flex item makes it shrink to its content and sit
+   in the middle - the picture came out two thirds of the screen wide with
+   white down both sides. */
+"main{flex:1 1 auto;min-height:0;max-width:none;margin:0;padding:8px;gap:8px;\n"
+"  grid-template-columns:1fr;grid-template-rows:minmax(200px,1fr) auto auto}\n"
+/* Logo over badge, both centred. A visitor reads top to bottom from a few
+   metres away and the badge is what they are meant to come away with, so it
+   sits directly under the logo with nothing competing beside it. */
+"header{flex-direction:column;align-items:center;gap:6px;\n"
+"  padding:10px 16px 12px}\n"
+"header .logo{height:38px}\n"
+"header .stackbox{margin-left:0;flex-direction:column;align-items:center;\n"
+"  gap:3px}\n"
+"header .tag{order:1;font-size:40px;padding:4px 32px;letter-spacing:2px;\n"
+"  min-width:0;border-radius:10px}\n"
+/* Both captions go. "Hardwired TCP/IP - the WIZnet chip terminates TCP" is a
+   sentence, and nobody walking past a booth reads a sentence - the badge is
+   what lands, and a line of explanation under it only competes with it. The
+   device address is for whoever set the board up, and they already know it.
+
+   Worth about 50px of header, which goes straight into the picture. */
+"header .what,header .sub{display:none}\n"
+/* Everything that needs a decision. The board autostarts and the visitor is
+   not meant to change the run, so none of it should be reachable. */
+"#sec-ctl,#sec-sweep,#sec-ctrls,footer{display:none}\n"
+
+/* Three rows now: picture takes the slack, bar and graphs take what they
+   need. The bar is a bare strip, not a card - it reads as part of the
+   picture frame rather than as another panel. */
+"#sec-res{padding:0;border:0;background:transparent;box-shadow:none}\n"
+".resseg button{font-size:17px;padding:12px 0}\n"
+
+/* Mirrors the STREAMING pill on the other corner, one size up because it is
+   the only thing on the page that answers "what am I looking at". */
+".resnow{display:block;position:absolute;top:8px;right:10px;z-index:2;\n"
+"  padding:6px 20px;border-radius:999px;background:var(--stack);\n"
+"  color:#ffffff;font-size:26px;font-weight:800;letter-spacing:2px}\n"
+/* The picture is its own frame: no card padding, no border, black to the
+   edge. STREAMING becomes a pill over the top-left corner instead of a line
+   above the picture, which is ~30px of height back for the graphs. */
+"#sec-view{position:relative;padding:0;border:0;background:#000;\n"
+"  border-radius:8px;overflow:hidden}\n"
+"#sec-view h2{position:absolute;top:8px;left:10px;z-index:2;margin:0;\n"
+"  padding:4px 12px;border-radius:999px;background:rgba(0,0,0,.55);\n"
+"  color:#ffffff;font-size:11px}\n"
+/* The picture is taken out of the flow.
+
+   Left in it, the sizing is circular: the grid row is 1fr of the space left
+   over, but "left over" is computed from the content, and the content is a
+   720px-tall frame asking to be 720px tall. The row resolved to the frame and
+   the graphs went off the bottom of the screen.
+
+   Absolute inside a relative section means the frame contributes no height at
+   all, so the row is free to be whatever is left, and the frame then fills
+   that box. min-height:0 on the section is what lets a grid item shrink below
+   its content in the first place. */
+"#sec-view{min-height:0;overflow:hidden}\n"
+"#sec-view .view{position:absolute;top:0;right:0;bottom:0;left:0;\n"
+"  background:#000;border-radius:0}\n"
+/* width:auto with a height cap, not width:100% - the frame keeps its aspect
+   ratio and stops growing before it pushes the graphs off the screen. */
+/* Full width first, height capped second. width:100% makes the picture
+   reach both edges of the laptop, which is what the exhibit wants; the
+   max-height stops a 16:9 frame from being 760px tall on a 768px screen
+   and pushing the graphs off the bottom. When the cap bites, object-fit
+   letterboxes inside a black box, so the bars are invisible - and on a
+   taller screen the cap never bites and the frame really is edge to edge.
+   No fixed height: the box has to be free to shrink for a 4:3 mode. */
+"#sec-view .view img{width:100%;height:100%;object-fit:contain}\n"
+/* Graphs: the numbers stay large, the traces lose the height the picture
+   took. 130px still shows the shape of a drop, which is all it has to do. */
+"#sec-perf{padding:10px 14px}\n"
+"#sec-perf h2{display:none}\n"
+".charts{gap:18px}\n"
+".chead .big{font-size:34px}\n"
+/* 110px still shows the shape of a drop, which is all the trace has to do -
+   the number above it is what a visitor actually reads. */
+"canvas{height:110px}\n"
+".legend{font-size:11px}\n"
+".hint{font-size:11px}\n"
+#endif /* EXHIBITION_SIMPLE_UI */
+
 "</style>\n"
 "</head>\n"
 "<body>\n"
@@ -200,8 +338,12 @@ static const char HTTP_INDEX_PAGE[] =
 "</header>\n"
 "<div id='banner'></div>\n"
 "<main>\n"
-"  <section class='card'>\n"
+"  <section class='card' id='sec-view'>\n"
 "    <h2><span id='dot' class='dot'></span><span id='s-state'>-</span></h2>\n"
+/* Which mode is running, over the top-right of the picture, mirroring the
+   STREAMING pill on the left. Its text comes from the device reply, not from
+   the click, so it shows what the camera actually did. */
+"    <div class='resnow' id='resnow'>-</div>\n"
 /* No src here on purpose. With one, the browser opens the stream while this
    page is still being transferred, so the two compete for the same send path -
    and if the device is not streaming yet, that connection sits there holding a
@@ -209,7 +351,7 @@ static const char HTTP_INDEX_PAGE[] =
    status reply says the device is actually sending frames. */
 "    <div class='view'><img id='view' alt='camera stream'></div>\n"
 "  </section>\n"
-"  <section class='card'>\n"
+"  <section class='card' id='sec-ctl'>\n"
 "    <h2>Control</h2>\n"
 "    <div class='btns'>\n"
 "      <button id='start'>START</button>\n"
@@ -237,7 +379,33 @@ static const char HTTP_INDEX_PAGE[] =
 "      <dt>Load</dt><dd id='s-loadkb'>off</dd>\n"
 "    </dl>\n"
 "  </section>\n"
-"  <section class='card wide'>\n"
+/* The resolution bar sits AFTER the control card on purpose. In the full UI
+   that keeps the picture and the control column side by side and drops this
+   underneath them; in the simplified UI the control card is hidden, so the
+   bar lands directly between the picture and the graphs, which is where it
+   is wanted. One DOM, two layouts, no duplicated markup.
+
+   The data-res values are the same strings /api/res takes and the same ones
+   the select carries, so nothing has to translate between them. */
+"  <section class='card wide' id='sec-res'>\n"
+"    <div class='resseg' id='resseg'>\n"
+/* HD and FHD only.
+
+   The other three modes were measured and they do not separate the two
+   stacks: at QVGA and VGA the frame is small enough that both keep up, and
+   UXGA sits close enough to FHD that a visitor cannot tell the two runs
+   apart. Five buttons where three of them show the same thing is three
+   chances to pick the one that proves nothing.
+
+   The pixel count rides along in the label because the two together answer
+   both questions at once - what it is called, and how much more data it is.
+   The badge over the picture stays short; there is no room for a bracket
+   there and it is read from further away. */
+"      <button data-res='1280x720'>HD <small>(1280&times;720)</small></button>\n"
+"      <button data-res='1920x1080'>FHD <small>(1920&times;1080)</small></button>\n"
+"    </div>\n"
+"  </section>\n"
+"  <section class='card wide' id='sec-perf'>\n"
 "    <h2>Live performance</h2>\n"
 "    <div class='charts'>\n"
 "      <div>\n"
@@ -277,10 +445,14 @@ static const char HTTP_INDEX_PAGE[] =
    it reads zero, because the chip owns the buffer. One number, and it is the
    cost of terminating TCP on the MCU. */
 "      <span><i class='drain'></i>ACK wait <b id='s-drain'>0</b> ms</span>\n"
+/* Measured live rather than read off a map file. A link-time figure says
+   what was reserved; this says what a 1080p stream actually costs on top
+   of it, which is the question a visitor asks about a chip this size. */
+"      <span><i class='sram'></i>SRAM <b id='s-sram'>-</b></span>\n"
 "    </div>\n"
 "    <p class='hint' id='s-hint'>Start streaming to measure.</p>\n"
 "  </section>\n"
-"  <section class='card tight wide'>\n"
+"  <section class='card tight wide' id='sec-sweep'>\n"
 "    <div class='sweep'>\n"
 "      <div>\n"
 "        <label for='clk'>CLK_DIV <b id='v-clk'>2</b></label>\n"
@@ -295,7 +467,7 @@ static const char HTTP_INDEX_PAGE[] =
 "      <button id='recover' class='ghost'>Recover</button>\n"
 "    </div>\n"
 "  </section>\n"
-"  <section class='card wide'>\n"
+"  <section class='card wide' id='sec-ctrls'>\n"
 "    <h2>Sensor controls</h2>\n"
 "    <div id='ctrls' class='ctrls'>loading...</div>\n"
 "  </section>\n"
@@ -303,12 +475,18 @@ static const char HTTP_INDEX_PAGE[] =
 "<footer>Served from the device</footer>\n"
 "<script>\n"
 "var $=function(id){return document.getElementById(id)};\n"
+/* Pixel counts are what the device speaks; mode names are what a visitor
+   reads. The keys are exactly the strings /api/status returns, so an unknown
+   value falls through to the raw string rather than showing nothing. */
+"var RESNAME={'320x240':'QVGA','640x480':'VGA','1280x720':'HD',\n"
+"  '1600x1200':'UXGA','1920x1080':'FHD'};\n"
 "$('addr').textContent=location.host;\n"
 "var css=getComputedStyle(document.documentElement);\n"
 "var C=function(n){return css.getPropertyValue(n).trim()};\n"
 /* stalled counts polls where the device says it is streaming and its frame
    counter has not moved; misses counts polls that did not arrive at all. */
 "var last={},lastFrames=-1,stalled=0,misses=0,wasGone=false,opened=false;\n"
+"var lastRes=null;   // last resolution the device reported\n"
 /* How long the frame counter may sit still before the page calls it a
    stall, and how long it must wait before doing anything about it again.
 
@@ -494,11 +672,37 @@ static const char HTTP_INDEX_PAGE[] =
 "  $('start').disabled=s.streaming;\n"
 "  $('stop').disabled=!s.streaming;\n"
 "  if($('res').value!==s.res){$('res').value=s.res}\n"
+/* Clear the traces on any resolution change, including one this page did
+   not ask for.
+
+   The averages are the reason. min/avg/max are computed over the whole
+   history buffer, so HD samples left in it after a switch to FHD drag the
+   average toward a frame size that is no longer being sent - the page then
+   reports a number the device never achieved in either mode. The step in
+   the trace reads as the stack faltering when it is only a different
+   amount of data per frame.
+
+   Keyed off the reported value, not off the click, so a change made from
+   the other control - or from a second browser - clears the history too. */
+"  if(lastRes!==null&&lastRes!==s.res){\n"
+"    charts.forEach(function(c){c.hist=[];c.shown=0;c.target=0});\n"
+"    $('s-min').textContent='-';$('s-avg').textContent='-';\n"
+"    $('s-max').textContent='-';$('s-bwmax').textContent='-';\n"
+"  }\n"
+"  lastRes=s.res;\n"
+"  $('resnow').textContent=RESNAME[s.res]||s.res;\n"
+"  Array.prototype.forEach.call($('resseg').children,function(b){\n"
+"    b.className=(b.getAttribute('data-res')===s.res)?'on':''});\n"
 "  $('s-kb').textContent=s.kb;\n"
 "  $('s-vsync').textContent=s.vsync_ms;\n"
 "  $('s-read').textContent=s.read_ms;\n"
 "  $('s-send').textContent=s.send_ms;\n"
 "  $('s-drain').textContent=(s.drain_ms||0);\n"
+"  if(s.sram_total){\n"
+"    var kb=Math.round(s.sram_used/1024),tot=Math.round(s.sram_total/1024);\n"
+"    $('s-sram').textContent=kb+' / '+tot+' KB ('+\n"
+"      (s.sram_used*100/s.sram_total).toFixed(1)+'%)';\n"
+"  }\n"
 "  var loadMbps=(s.load_kbps||0)/1000;\n"
 "  $('s-load').textContent=loadMbps.toFixed(1);\n"
 "  $('s-loadkb').textContent=loadKB?(loadKB+' KB/req'):'off';\n"
@@ -521,12 +725,22 @@ static const char HTTP_INDEX_PAGE[] =
 "  $('s-hint').innerHTML=hint(s);\n"
 "  if(s.stack){\n"
 "    var toe=(s.stack==='TOE');\n"
-"    $('stack').textContent=toe?'TOE':'lwIP';\n"
+/* The badge is the one thing a visitor is meant to read from across the
+   room, so it carries the brand on the TOE side: "TOE" alone means
+   nothing to someone who has not been told what it stands for, and the
+   point of the exhibit is that the WIZnet chip is doing the work. lwIP is
+   left as a bare name - it is the thing being compared against, not the
+   thing being sold. */
+"    $('stack').textContent=toe?'WIZnet TOE':'lwIP';\n"
 "    $('what').textContent=toe\n"
 "      ?'Hardwired TCP/IP - the WIZnet chip terminates TCP'\n"
 "      :'Software TCP/IP - lwIP terminates TCP on the MCU';\n"
 "    document.documentElement.style.setProperty('--stack',\n"
-"      toe?'#e01b24':'#1f2933');\n"
+/* Red for the TOE, grey for lwIP - not a second colour. A near-black
+   badge still reads as an emphasis; grey reads as the plain alternative,
+   which is the comparison the exhibit is making. #6f7a86 is dark enough
+   to keep white text legible on a projector. */
+"      toe?'#e01b24':'#6f7a86');\n"
 "    document.title=s.stack+' camera';\n"
 "  }\n"
 "  if(document.activeElement!==$('clk')&&document.activeElement!==$('pll')){\n"
@@ -722,13 +936,21 @@ static const char HTTP_INDEX_PAGE[] =
 "$('start').onclick=function(){call('/api/start').then(function(){\n"
 "  setTimeout(function(){restartStream(true)},150)}).catch(offline)};\n"
 "$('stop').onclick=function(){call('/api/stop').catch(offline)};\n"
-"$('res').onchange=function(){\n"
-"  var v=this.value;\n"
-"  charts.forEach(function(c){c.hist=[];c.shown=0;c.target=0});\n"
+/* One path for changing resolution, whichever control asked for it.
+
+   Neither the lit button nor the cleared history is decided here. Both are
+   driven off the next status reply, so they follow what the camera actually
+   did - if the device refuses a mode, the page does not throw away a good
+   trace or move the highlight for a change that never happened. */
+"function applyRes(v){\n"
 "  call('/api/res?v='+v).then(function(){\n"
 "    setTimeout(function(){restartStream(true)},400)})\n"
 "    .catch(offline);\n"
-"};\n"
+"}\n"
+"$('res').onchange=function(){applyRes(this.value)};\n"
+"Array.prototype.forEach.call($('resseg').children,function(b){\n"
+"  b.onclick=function(){applyRes(b.getAttribute('data-res'))};\n"
+"});\n"
 "$('clk').oninput=function(){$('v-clk').textContent=this.value};\n"
 "$('pll').oninput=function(){$('v-pll').textContent=this.value};\n"
 "function applyClk(c,p){\n"

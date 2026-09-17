@@ -71,6 +71,11 @@ void        cam_state_metrics_reset(void);
 /** Roll the window over into the reported values once a second has passed. */
 void        cam_state_metrics_update(void);
 
+/* SRAM in use right now: statics + heap handed out, in bytes. The stack is not
+ * counted, so this is a floor. cam_state.c explains what dominates the figure. */
+uint32_t    cam_state_sram_used(void);
+uint32_t    cam_state_sram_total(void);
+
 /* -------------------------------- Reporting -------------------------------- */
 /*
  * Big enough for the fixed fields plus the whole control table. The status

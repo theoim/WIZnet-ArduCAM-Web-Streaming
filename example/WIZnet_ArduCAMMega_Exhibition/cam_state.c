@@ -5,15 +5,58 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <malloc.h>
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "hardware/regs/addressmap.h"
 
 #include "cam_state.h"
 #include "cam_controls.h"
 #include "net_load.h"
 #include "exhibition_config.h"
 #include "arducam_mega.h"
+
+/* ------------------------------ SRAM reporting ----------------------------- */
+/*
+ * How much of the chip's RAM this build is actually using, reported live so it
+ * can be read while the stream runs rather than inferred from a map file.
+ *
+ * The number that matters at an exhibition is the one taken under load: a map
+ * file shows what was reserved at link time, and the interesting question is
+ * what a 1080p stream costs on top of that.
+ *
+ * used = statics + heap actually handed out.
+ *
+ *   statics   everything the linker placed, up to __bss_end__. On this build
+ *             that is dominated by one object: image_buff, the 200 KB JPEG
+ *             capture buffer in arducam_mega.c. It does not grow with the
+ *             selected resolution - a 1080p frame lands in the same array a
+ *             QVGA frame does - so the resolution buttons move the network
+ *             numbers, not this one.
+ *   heap      mallinfo().uordblks, the bytes currently allocated. The lwIP
+ *             image lives here; the TOE image barely touches it.
+ *
+ * The stack is NOT counted. Its 8 KB sits above __StackLimit and how much of it
+ * is actually touched is not something malloc can see, so the figure reported
+ * here is a floor, not a ceiling.
+ */
+extern char __StackTop;
+extern char __StackLimit;
+extern char __bss_end__;
+
+uint32_t cam_state_sram_total(void)
+{
+    return (uint32_t)(&__StackTop - (char *)SRAM_BASE);
+}
+
+uint32_t cam_state_sram_used(void)
+{
+    struct mallinfo mi = mallinfo();
+    uint32_t statics = (uint32_t)(&__bss_end__ - (char *)SRAM_BASE);
+
+    return statics + (uint32_t)mi.uordblks;
+}
 
 /* -------------------------------- Variables -------------------------------- */
 static volatile bool  g_streaming   = false;
@@ -259,6 +302,7 @@ int cam_state_status_json(char *buf, size_t cap)
                  "\"send_ms\":%lu,\"drain_ms\":%lu,\"kb\":%lu,"
                  "\"clk_div\":%u,\"pll_div\":%u,"
                  "\"load_kbps\":%lu,"
+                 "\"sram_used\":%lu,\"sram_total\":%lu,"
                  "\"stack\":\"" STACK_NAME "\",\"ctrl\":{",
                  g_streaming ? "true" : "false",
                  cam_state_res_string(g_resolution),
@@ -273,7 +317,9 @@ int cam_state_status_json(char *buf, size_t cap)
                  (unsigned long)g_frame_kb,
                  (unsigned)arducam_clk_div,
                  (unsigned)arducam_pll_div,
-                 (unsigned long)g_load_kbps);
+                 (unsigned long)g_load_kbps,
+                 (unsigned long)cam_state_sram_used(),
+                 (unsigned long)cam_state_sram_total());
     if (n < 0 || (size_t)n >= cap) {
         return -1;
     }
