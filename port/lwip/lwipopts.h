@@ -57,11 +57,35 @@
  * then ran fine: the pool was full of connections that had been closed since
  * the page loaded.
  *
- * 5 s of TIME_WAIT is ample on a local link where the round trip is under a
- * millisecond, and ten pcbs cost about 2 KB.
+ * TCP_MSL is 2000, so TIME_WAIT is 2*MSL = 4 s. It was 5000 - ten seconds -
+ * which is what made the pool the binding constraint: a resolution change
+ * leaves six or seven pcbs waiting, and at one change every three seconds
+ * (the page's own rate limit) three changes' worth overlap before the first
+ * has expired. Shortening the wait cuts the overlap without costing a byte.
+ *
+ * Four seconds is still four thousand times the round trip on a local link.
+ *
+ * Pool raised from 10 to 16 after measuring it.
+ *
+ * Idle costs one pcb. A resolution change costs six or seven: the stream
+ * connection is torn down and reopened, and the connections the browser had in
+ * flight are closed with it, each leaving a pcb in TIME_WAIT for 2*MSL. Two
+ * changes in quick succession reached 8/10 and four reached 10/10 - the whole
+ * pool, with one active connection and nine waiting.
+ *
+ * It never errored, because tcp_alloc() kills the oldest TIME_WAIT pcb before
+ * it gives up. That is the problem rather than the reassurance: with the pool
+ * full, the next connection is served by killing something, and there is no
+ * rule that says the something will be a finished connection rather than the
+ * live stream. At an exhibition the buttons get pressed repeatedly by people
+ * who want to see what they do.
+ *
+ * Six more pcbs cost about 900 bytes of static RAM - 0.2 % of the 520 KB on
+ * this part. The page also rate-limits the resolution buttons now, so this is
+ * the second line of defence rather than the first.
  */
-#define TCP_MSL             5000
-#define MEMP_NUM_TCP_PCB    10
+#define TCP_MSL             2000
+#define MEMP_NUM_TCP_PCB    16
 
 // disable ACD to avoid build errors
 // http://lwip.100.n7.nabble.com/Build-issue-if-LWIP-DHCP-is-set-to-0-td33280.html

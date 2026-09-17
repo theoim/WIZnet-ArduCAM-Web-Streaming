@@ -942,7 +942,27 @@ static const char HTTP_INDEX_PAGE[] =
    driven off the next status reply, so they follow what the camera actually
    did - if the device refuses a mode, the page does not throw away a good
    trace or move the highlight for a change that never happened. */
+/* Rate limited, because a resolution change is far more expensive on the
+   device than it looks from the page.
+
+   Each one tears the stream connection down and opens a new one, and the
+   connections the browser had in flight go with it. Measured on the lwIP
+   image: one change leaves six or seven pcbs in TIME_WAIT for 2*MSL, two in
+   quick succession reach 8/10, and four reach 10/10 - the entire pool, one
+   active connection and nine waiting. lwIP then serves the next connection by
+   killing something, and nothing guarantees it picks a finished connection
+   over the live stream.
+
+   Three seconds is longer than the 2*MSL of 10 s divided by the pool, which
+   is the rate the device can actually retire them, but short enough that a
+   visitor pressing the other button does not think it is broken. The pool was
+   raised to 16 as well; this is the half that stops the burst from happening
+   rather than the half that absorbs it. */
+"var RES_COOLDOWN=3000,lastRes_ms=0;\n"
 "function applyRes(v){\n"
+"  var now=Date.now();\n"
+"  if(now-lastRes_ms<RES_COOLDOWN){return}\n"
+"  lastRes_ms=now;\n"
 "  call('/api/res?v='+v).then(function(){\n"
 "    setTimeout(function(){restartStream(true)},400)})\n"
 "    .catch(offline);\n"
