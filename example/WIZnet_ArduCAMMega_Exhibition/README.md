@@ -329,12 +329,169 @@ value.
 
 ---
 
+## Show build, 2026-09-16/17
+
+Changes made after running the demo on the laptop that actually goes to the
+show, rather than the desk monitor it was built on. All of it is measured on
+hardware unless the section says otherwise.
+
+### Simplified page — `EXHIBITION_SIMPLE_UI`
+
+On by default. The full page assumes a sidebar and 1440p; on 1366x768 the
+control column pushed the picture down until the graphs fell below the fold, so
+the one thing the exhibit is about - the stream degrading - was off screen.
+
+Same markup, same script. Only what gets painted changes, so switching back is
+one `#define` in `exhibition_config.h` and not a merge. The page is logo, stack
+badge, picture edge to edge, then the two graphs. START/STOP, the resolution
+dropdown, the link load row and the bring-up controls are hidden: the board
+autostarts and none of it is a visitor's decision.
+
+The picture is not given a size. It takes whatever is left after the header and
+the graph row, which is the only version that survives an unknown laptop.
+Verified at 1280x720, 1366x768 and 1920x1080.
+
+**Hiding the link load hides the comparison this build was made for.** With it
+off a visitor sees one stack running clean, not the TOE holding up while lwIP
+gives way. If the load is meant to be part of the demo, either set the switch
+to 0 or drive the load from the host instead of the page.
+
+### Resolution bar — HD and FHD only
+
+A wide segmented row between the picture and the graphs, plus the running mode
+over the picture. The other three modes do not separate the two stacks: at QVGA
+and VGA both keep up, and UXGA sits close enough to FHD that the two runs look
+alike. Five buttons where three show the same thing is three chances to pick the
+one that proves nothing.
+
+The lit button and the cleared history are both driven off the status reply, not
+off the click, so they follow what the camera actually did.
+
+**The graph history is cleared on any resolution change.** min/avg/max are
+computed over the whole buffer, so HD samples left in it after a switch to FHD
+dragged the average toward a frame size that was no longer being sent - the page
+reported a number the device never achieved in either mode.
+
+### Boots at HD
+
+`cam_state.c` defaults to `RES_1280X720`. Changing the default alone was not
+enough and the way it failed is worth keeping:
+
+`arducam_mega.init()` sets JPEG and 320x240 itself, with a 200 ms settle between
+and after. `main.c` overrode it by calling `set_pixel_format()` and
+`set_frame_size()` back to back with no wait, and the resolution write was
+silently dropped. The console printed
+
+```
+Setting initial resolution to 320x240...     (driver, inside init)
+Initial resolution: 1280x720                 (ours, from our own state)
+```
+
+while the sensor sent 4 KB frames at 0.3 Mbps. Neither line was wrong; neither
+was asking the sensor. `main.c` now uses the same settles and checks
+`set_frame_size()`'s return value instead of throwing it away.
+
+### SRAM reported live
+
+`/api/status` carries `sram_used` and `sram_total`; the legend shows both. A map
+file says what was reserved at link time, and the question worth answering is
+what a stream costs on top of that while it runs.
+
+`used = statics + mallinfo().uordblks`. The stack is not counted, so it is a
+floor.
+
+| image | static | of 520 KB | flash |
+|---|---:|---:|---:|
+| `exhibition_toe` | 217.4 KB | 41.8 % | 124.3 KB |
+| `exhibition_lwip` | 291.3 KB | 56.0 % | 171 KB |
+
+The 74 KB difference is what terminating TCP on the MCU costs here, and it
+breaks down cleanly:
+
+| object | size |
+|---|---:|
+| `memp_memory_PBUF_POOL_base` | 47.9 KB |
+| `ram_heap` (`MEM_SIZE`) | 16.0 KB |
+| `memp_memory_TCP_PCB_base` | 2.4 KB |
+| `memp_memory_TCP_SEG_base` | 1.9 KB |
+| other lwIP structures | ~5.7 KB |
+
+`image_buff`, the 200 KB JPEG capture buffer, is in both and dominates each. It
+does not grow with the selected resolution - a 1080p frame lands in the same
+array a QVGA frame does - so the resolution buttons move the network numbers,
+not this one.
+
+### The pcb pool ran out
+
+Found by pressing the HD/FHD buttons the way a visitor would.
+
+```
+[lwip] pcb 10/10 e0 ...
+[lwip] active 1  time_wait 9
+```
+
+One live connection and nine finished ones holding the rest of the pool. It
+never reported an error, because `tcp_alloc()` kills the oldest TIME_WAIT pcb
+before it gives up - which is the problem rather than the reassurance. With the
+pool full every new connection is served by killing something, and nothing
+guarantees it picks a finished connection over the live stream.
+
+A resolution change is more expensive on the device than it looks from the page:
+the stream connection is torn down and reopened and the connections the browser
+had in flight go with it, leaving six or seven pcbs in TIME_WAIT.
+
+Three changes, in order of how much they mattered:
+
+- **`TCP_MSL` 5000 -> 2000.** TIME_WAIT is `2*MSL`, so it was ten seconds. At one
+  change every three seconds, three changes' worth overlapped before the first
+  expired. Four seconds is still four thousand times the round trip on a local
+  link, and it costs nothing. This is the one that did the work.
+- **`MEMP_NUM_TCP_PCB` 10 -> 16.** Headroom for when the burst gets through
+  anyway. About 900 bytes of static RAM, 0.2 % of the part.
+- **3 s rate limit on the resolution buttons.** Page side, no RAM. Stops the
+  burst rather than absorbing it.
+
+Measured after, same test:
+
+```
+before   peak 10/10,  6-7 held while clicking,  no headroom
+after    peak  8/16,  3   held while clicking,  8 spare
+```
+
+Everything else had room throughout: TCP_SEG peaked at 14 of 96, PBUF at 15 of
+96, PBUF_POOL at 1 of 32, the lwIP heap at 3,724 of 16,384.
+
+### Security: what would fit
+
+Reviewed, not implemented, and **not measured.** RAM and flash are not the
+constraint:
+
+- Four concurrent TLS sessions with 4 KB record buffers is roughly 40 KB. The
+  TOE image has 294.6 KB of heap free at boot, the lwIP image 221.6 KB.
+- Flash would go to roughly 220-270 KB against 4 MB.
+
+The open question is throughput. **RP2350 has hardware SHA-256 and a TRNG but no
+AES accelerator**, and the HD stream is about 574 KB/s (41 KB frames at ~14 fps)
+that would all have to pass through software AES-GCM. Two numbers decide it and
+neither has been taken:
+
+1. AES-128-GCM throughput in KB/s - does the stream fit?
+2. ECDSA P-256 sign time - how long does a connection take?
+
+If the first falls short, ChaCha20-Poly1305 is usually 2-4x faster than AES-GCM
+on a 32-bit MCU without AES hardware, and mbedTLS supports it on TLS 1.2 and 1.3.
+
+---
+
 ## Known limits
 
 Where this build stops. None of these are accidents.
 
 - **Not measured.** No frame rates are quoted here because none have been taken
   on a bench with both boards. Take them with the charts before quoting any.
+  The RAM figures under "Show build" above ARE measured, but at link time plus
+  idle heap - the number a running stream adds is what the live SRAM readout is
+  for, and it has not been recorded here.
 - **The TOE side blocks while it sends.** `tcp_send_all()` spins until the chip
   takes the bytes, so a frame going out is time the other sockets are not
   polled. The load demo makes that visible, which is useful — but it also means
@@ -345,7 +502,8 @@ Where this build stops. None of these are accidents.
   example and not made worse here, but the load generator makes large responses
   ordinary rather than rare.
 - **No authentication, no TLS.** Anything that can reach the address can watch
-  the camera and change its settings.
+  the camera and change its settings. What would fit is reviewed under "Show
+  build" above; the throughput measurement that decides it has not been taken.
 - **The load is generated by the browser.** A laptop that cannot keep the
   requests coming lowers the load without saying so — which is why the device
   reports the bytes it actually served rather than the slider position. If the
