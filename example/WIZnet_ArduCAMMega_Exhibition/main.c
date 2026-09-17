@@ -73,8 +73,29 @@ int main(void)
 
     printf("Initializing ArduCAM MEGA...\n");
     arducam_mega.init();
+
+    /*
+     * init() leaves the sensor at QVGA - it sets JPEG and 320x240 itself, with
+     * a 200 ms settle between and after. Overriding it needs the same timing:
+     * the first version called set_pixel_format() and set_frame_size() back to
+     * back with no wait and the resolution write was silently dropped. The
+     * console then printed "Initial resolution: 1280x720" while the sensor was
+     * still sending 4 KB QVGA frames, because that line reports our own state
+     * and nobody checked what the sensor did with the write.
+     *
+     * The return value is checked now for the same reason. set_frame_size()
+     * reports a failed I2C write and the old code threw it away.
+     */
+    sleep_ms(200);
     arducam_mega.set_pixel_format(PIXFORMAT_JPEG);
-    arducam_mega.set_frame_size(cam_state_resolution());
+    sleep_ms(200);
+
+    if (arducam_mega.set_frame_size(cam_state_resolution()) != 0) {
+        printf("WARNING: set_frame_size(%s) failed - sensor may still be at "
+               "the driver default\n",
+               cam_state_res_string(cam_state_resolution()));
+    }
+    sleep_ms(200);
 
     /*
      * The control table is NOT pushed into the sensor at boot.

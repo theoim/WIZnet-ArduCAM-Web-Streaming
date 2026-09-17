@@ -60,7 +60,12 @@ uint32_t cam_state_sram_used(void)
 
 /* -------------------------------- Variables -------------------------------- */
 static volatile bool  g_streaming   = false;
-static volatile res_t g_resolution  = RES_320X240;
+/* HD, not QVGA. The board is powered on before the doors open and whatever is
+ * set here is what a visitor walks up to, so it has to be a mode worth looking
+ * at - and one of the two the page offers, or the resolution bar would start
+ * with neither button lit. main.c configures the sensor from this value at
+ * boot, so changing it here is enough. */
+static volatile res_t g_resolution  = RES_1280X720;
 
 static uint32_t g_frame_count = 0;
 static uint32_t g_drop_count  = 0;
