@@ -149,4 +149,5 @@ add_subdirectory(example)
 add_subdirectory(${CMAKE_SOURCE_DIR}/libraries)
 add_subdirectory(${MBEDTLS_DIR})
 add_subdirectory(${PORT_DIR})
+add_subdirectory(${CMAKE_SOURCE_DIR}/port/wiz-claw)
 

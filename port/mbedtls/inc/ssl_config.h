@@ -77,6 +77,26 @@
 #define MBEDTLS_ECP_DP_SECP384R1_ENABLED
 #define MBEDTLS_SHA256_C
 
+/* ---- Discord / Google Trust Services chain -------------------------------
+ *
+ * discord.com presents an ECDSA chain:
+ *     discord.com  <-  WE1  <-  GTS Root R4
+ *
+ * Every line below exists for some part of verifying that. Without them the
+ * handshake fails at certificate parsing or at signature verification, which
+ * from the outside looks the same as a network fault - so they are listed with
+ * their reasons rather than as a block of defines.
+ */
+#define MBEDTLS_ECP_DP_SECP256R1_ENABLED        /* P-256: ECDHE key exchange */
+#define MBEDTLS_ECDH_C                          /* ECDHE itself */
+#define MBEDTLS_ECDSA_C                         /* verifying an EC chain */
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED /* servers with EC certs */
+#define MBEDTLS_ENTROPY_C                       /* CTR-DRBG depends on it */
+#define MBEDTLS_SHA1_C                          /* some chains still sign with it */
+#define MBEDTLS_SHA512_C
+#define MBEDTLS_SHA384_C                        /* GTS Root R4 is ecdsa-with-SHA384 */
+
 #define MBEDTLS_SSL_CLI_C
 #define MBEDTLS_SSL_TLS_C
 #define MBEDTLS_VERSION_C
