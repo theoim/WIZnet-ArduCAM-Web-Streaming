@@ -53,7 +53,8 @@ bool webserver_streaming(void);
  * the number someone needs while deciding where to mount the box is how close
  * the quiet room already sits to the threshold.
  */
-void webserver_set_detail(int hz, float tone);
+void webserver_set_detail(int hz, float tone, float rms, float baseline,
+                          float loud_k, float enter_ratio);
 
 /** Service all sockets once. Non-blocking; call from the main loop. */
 void webserver_poll(void);

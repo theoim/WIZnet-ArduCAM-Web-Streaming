@@ -477,6 +477,25 @@ static wiz_claw_err_t do_http_request(uint8_t     sn,
     wiz_claw_err_t        err;
     bool                  tls_inited = false;
 
+    /*
+     * Where the seconds go.
+     *
+     * A post takes six to eight seconds and that is long enough to be worth
+     * breaking down rather than guessing at. The four parts want different
+     * fixes and only one of them is worth doing:
+     *
+     *   dns        goes away entirely if the address is cached
+     *   connect    three round trips, nothing to be done about it
+     *   handshake  mbedTLS arithmetic plus two more round trips. If this is the
+     *              bulk, the only way to keep a stream alive through it is to
+     *              drive the handshake a step at a time
+     *   transfer   the upload itself, which is 45 KB for a photo
+     *
+     * Printed once per request, so the cost is one line and no state.
+     */
+    uint32_t t_start = to_ms_since_boot(get_absolute_time());
+    uint32_t t_dns = 0, t_conn = 0, t_hs = 0, t_xfer = 0;
+
     if (timeout_ms == 0) { timeout_ms = HTTP_DEFAULT_TIMEOUT_MS; }
 
     /* 1. URL 파싱 */
@@ -485,6 +504,7 @@ static wiz_claw_err_t do_http_request(uint8_t     sn,
 
     /* 2. DNS 해석 */
     err = wiz_claw_net_dns_resolve(parsed.host, ip);
+    t_dns = to_ms_since_boot(get_absolute_time()) - t_start;
     if (err != WIZ_CLAW_OK) { goto done; }
 
     /* 3. 전송 계층 초기화 및 연결 */
@@ -495,15 +515,26 @@ static wiz_claw_err_t do_http_request(uint8_t     sn,
         .timeout_ms = timeout_ms,
     };
 
+    uint32_t t_mark = to_ms_since_boot(get_absolute_time());
+
     if (parsed.is_https) {
         err = wiz_claw_tls_init(&s_tls, sn, timeout_ms);
         if (err != WIZ_CLAW_OK) { goto done; }
         tls_inited = true;
+        t_conn = to_ms_since_boot(get_absolute_time()) - t_mark;
+        t_mark = to_ms_since_boot(get_absolute_time());
+
+        /* Connect and handshake are one call here, so the split below is
+         * "everything TLS" rather than TCP and TLS separately. */
         err = wiz_claw_tls_connect(&s_tls, ip, parsed.port, parsed.host, timeout_ms);
+        t_hs = to_ms_since_boot(get_absolute_time()) - t_mark;
     } else {
         err = wiz_claw_tcp_connect(sn, ip, parsed.port, timeout_ms);
+        t_conn = to_ms_since_boot(get_absolute_time()) - t_mark;
     }
     if (err != WIZ_CLAW_OK) { goto done_tls; }
+
+    t_mark = to_ms_since_boot(get_absolute_time());
 
     /* 4. 요청 헤더 빌드 및 전송 */
     size_t body_bytes = body ? req_body_len : 0;
@@ -596,6 +627,13 @@ close:
     tls_inited = false;
 
 done_tls:
+    t_xfer = to_ms_since_boot(get_absolute_time()) - t_mark;
+    WIZ_CLAW_LOG_I(TAG,
+                   "timing: dns %lu  setup %lu  handshake %lu  transfer %lu  "
+                   "total %lu ms",
+                   (unsigned long)t_dns, (unsigned long)t_conn,
+                   (unsigned long)t_hs, (unsigned long)t_xfer,
+                   (unsigned long)(to_ms_since_boot(get_absolute_time()) - t_start));
     if (tls_inited) {
         wiz_claw_tls_free(&s_tls);
     }

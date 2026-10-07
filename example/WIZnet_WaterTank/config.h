@@ -139,12 +139,17 @@
  * the second goes into frames does not go into audio: at 200 ms the microphone
  * was down to 24 blocks a second out of 62.
  *
- * 500 ms is two frames a second. Water does not rise fast enough to need more,
- * and it leaves five sixths of the second for the thing the box is actually
- * for. The way to have both is to move the camera onto core 1 - the exhibition
- * build did exactly that - not to shorten this.
+ * It was 500 ms, and that number was a single-core compromise: every frame was
+ * audio the microphone did not get, so two a second was as much as could be
+ * afforded. Moving the camera to core 1 removed that argument entirely - the
+ * measured overrun count during streaming is now zero.
+ *
+ * 100 ms is not a promise of ten frames a second. It is a floor low enough to
+ * stop being the limit, so that whatever the camera and the link can actually
+ * do is what shows up in the [cam] line. Set it from that measurement rather
+ * than from hope.
  */
-#define STREAM_MIN_INTERVAL_MS  500
+#define STREAM_MIN_INTERVAL_MS  100
 
 /*
  * TCP keepalive, in units of 5 seconds, applied to each web connection.
@@ -170,6 +175,20 @@
  * the scan covers a range instead of one frequency, so the first alarm reports
  * which bin fired and the range can be narrowed afterwards.
  */
+/*
+ * Where the detector starts, before anybody adjusts it from the panel.
+ *
+ * Measured against the real sounder: the room read 0.004 to 0.008 and the
+ * buzzer 0.012 to 0.016, so 2.2 times the learned background sits above the
+ * room's own peaks and below the buzzer's floor. The tonal threshold of 20 was
+ * chosen the same way, between a shouted voice at 15 and a tone at 23 and up.
+ *
+ * Both are starting points. The values that ship to a site should come from
+ * that site's own numbers, read off the panel while its buzzer sounds.
+ */
+#define DETECT_LOUD_K       2.2f
+#define DETECT_ENTER_RATIO  20.0f
+
 #define SCAN_LO_HZ          1500.0f
 #define SCAN_HI_HZ          4500.0f
 

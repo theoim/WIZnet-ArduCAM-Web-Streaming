@@ -35,7 +35,15 @@
 #define _CRT_SECURE_NO_DEPRECATE 1
 #endif
 
-// #define MBEDTLS_HAVE_ASM
+/*
+ * Bignum multiply in assembly instead of C.
+ *
+ * mbedTLS ships hand-written paths for ARM and the compiler's output is not
+ * close. This was commented out, which is most likely an oversight rather than
+ * a decision - the same line on the OPC UA repository took an RSA-2048 private
+ * operation down by 28 % for the cost of a rebuild.
+ */
+#define MBEDTLS_HAVE_ASM
 #define MBEDTLS_CIPHER_MODE_CBC
 #define MBEDTLS_REMOVE_ARC4_CIPHERSUITES
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
@@ -88,6 +96,30 @@
  * their reasons rather than as a block of defines.
  */
 #define MBEDTLS_ECP_DP_SECP256R1_ENABLED        /* P-256: ECDHE key exchange */
+
+/*
+ * Curve arithmetic, tuned. Measured need: the TLS handshake to Discord took
+ * 8105, 8114 and 8125 ms on three separate posts - three figures inside 20 ms
+ * of each other, which is arithmetic rather than round trips. A handshake that
+ * is almost entirely computation on a 150 MHz M33 says the curve code is
+ * running its slowest path.
+ *
+ *   NIST_OPTIM        reduction modulo the P-256 prime by its special form -
+ *                     shifts and adds - instead of a general division. This is
+ *                     the big one; without it every field operation in every
+ *                     scalar multiplication goes the long way round.
+ *   WINDOW_SIZE       how many bits of the scalar are consumed per step. Larger
+ *                     windows mean fewer point additions and a bigger table.
+ *   FIXED_POINT_OPTIM precomputation for multiplications against the curve's
+ *                     base point, which is what key generation does.
+ *
+ * All three trade flash and RAM for time, which is the right way round here:
+ * the board has both, and what it does not have is a core to spare while a
+ * handshake runs.
+ */
+#define MBEDTLS_ECP_NIST_OPTIM
+#define MBEDTLS_ECP_WINDOW_SIZE         6
+#define MBEDTLS_ECP_FIXED_POINT_OPTIM   1
 #define MBEDTLS_ECDH_C                          /* ECDHE itself */
 #define MBEDTLS_ECDSA_C                         /* verifying an EC chain */
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED

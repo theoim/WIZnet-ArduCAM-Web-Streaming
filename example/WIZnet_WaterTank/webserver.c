@@ -12,12 +12,17 @@
 #include "socket.h"
 #include "wizchip_conf.h"
 
+#include <math.h>
+
 #include "webserver.h"
 #include "config.h"
 #include "settings.h"
 #include "arducam_mega.h"
 
 extern uint8_t image_buff[];        /* the camera driver owns this */
+
+/* In main.c, beside the detector it writes to. */
+void mic_set_thresholds(float loud_k, float enter_ratio);
 
 /* --------------------------------------------------------------- per socket */
 
@@ -50,14 +55,40 @@ typedef struct {
 } conn_t;
 
 /* How much is offered to the chip in one pass. Small enough that the chip
- * always has room for it soon after the previous one left. */
+ * always has room for it soon after the previous one left; the W6300 gives each
+ * socket a 4 KB transmit buffer, so half of it leaves room for the previous
+ * chunk to still be draining. */
 #define TX_CHUNK    2048
+
+/*
+ * Frame cost, in two halves, because they have different cures.
+ *
+ *   capture   the sensor's own frame wait plus the JPEG over SPI. Bounded by
+ *             the camera; a lower resolution is the only lever.
+ *   send      the same bytes onto the wire. Bounded by the link and by the
+ *             viewer, which on a phone over a forwarded port is the slow end.
+ *
+ * Printed every two seconds and only while something is watching, so an idle
+ * box stays quiet.
+ */
+static uint32_t s_fr_count, s_fr_bytes;
+static uint64_t s_fr_cap_us, s_fr_send_us;
+static uint32_t s_fr_report_ms;
+static uint64_t s_fr_start_us;
+static uint64_t s_fr_cap_this;
 
 /* A frame that has not finished inside this is a client that is not reading.
  * Dropping it costs one frame; waiting for it costs the microphone. */
 #define TX_TIMEOUT_MS   3000
 
 static conn_t   s_conn[SOCK_HTTP_COUNT];
+
+/*
+ * Written by the detector and read by the server. On the dual-core image those
+ * are different cores, so it is volatile: without that the compiler is entitled
+ * to hold it in a register across the polling loop and never notice it changed.
+ * One writer, one reader, one bool - no lock is needed beyond that.
+ */
 
 static void listen_again(uint8_t sn, conn_t *c);
 
@@ -87,12 +118,37 @@ static void drop_streams(uint8_t keep_sn)
         listen_again(sn, &s_conn[i]);
     }
 }
-static bool     s_alarm;
+static volatile bool s_alarm;
 static uint32_t s_last_request_ms;
 static uint32_t s_reboot_at_ms;     /* non-zero once a save has been accepted */
 
-static float    s_tone;
-static int      s_hz;
+static volatile float s_tone;
+static volatile int   s_hz;
+
+/*
+ * What the microphone is hearing right now, for the panel's meters.
+ *
+ * Written by core 0 once per block and read by core 1 once a second, so a torn
+ * float would cost one wrong digit for one second on a display. That is a long
+ * way from worth a lock.
+ */
+static volatile float s_rms, s_base, s_loud_k, s_enter;
+
+/*
+ * Peak held between reads, not the last block.
+ *
+ * A block is 16 ms and the panel asks once every few hundred milliseconds, so
+ * reporting whatever the most recent block happened to be means a shout lands
+ * between two reads and never appears. Somebody adjusting a threshold by making
+ * a noise at the microphone would see nothing move and conclude the microphone
+ * is broken.
+ *
+ * Core 0 raises these and the server clears them on read: whatever the loudest
+ * and most tonal moment since the last look was, that is what gets drawn.
+ */
+static volatile float    s_peak_rms, s_peak_tone;
+static volatile int      s_peak_hz;
+static volatile uint32_t s_blocks;      /* ever, so the panel can see it move */
 
 #define REQ_BUF_SIZE    1600
 
@@ -314,9 +370,28 @@ static void send_page(uint8_t sn)
         "font:15px -apple-system,system-ui,sans-serif}"
         "header{padding:12px 14px;background:#1b1b1b;font-weight:600}"
         "nav{display:flex;background:#1b1b1b;border-bottom:1px solid #333}"
-        "nav button{flex:1;padding:12px;background:none;border:none;color:#888;"
-        "font:inherit;border-bottom:2px solid transparent}"
+        /*
+         * Every property a button can inherit or be given by the browser is set
+         * here, rather than only the ones that looked wrong.
+         *
+         * The third tab rendered with a box around it and its label cut in half
+         * while the first two were fine, and chasing that one difference cost
+         * two attempts. A control that is styled by subtraction - turn off the
+         * border, turn off the background - keeps whatever was not named, and
+         * what was not named here was its height, its box model, its radius and
+         * its platform appearance. Naming them all is both shorter to reason
+         * about and the end of that class of bug.
+         */
+        "nav button{appearance:none;-webkit-appearance:none;"
+        "flex:1 1 0;min-width:0;box-sizing:border-box;"
+        "margin:0;padding:0 8px;height:46px;line-height:44px;"
+        "background:transparent;border:0;border-radius:0;"
+        "border-bottom:2px solid transparent;"
+        "color:#888;font:inherit;white-space:nowrap;overflow:hidden;"
+        "text-overflow:ellipsis;cursor:pointer}"
         "nav button.a{color:#fff;border-bottom-color:#2ecc71}"
+        "nav button:focus{outline:none}"
+        "nav button:focus-visible{outline:2px solid #2ecc71;outline-offset:-4px}"
         ".s{display:flex;align-items:center;gap:10px;padding:10px 14px;"
         "border-bottom:1px solid #222}"
         ".s span{flex:0 0 92px;color:#999;font-size:13px}"
@@ -354,10 +429,26 @@ static void send_page(uint8_t sn)
         "#msg{padding:0 14px 16px;font-size:13px;color:#888;line-height:1.5}"
         ".h{color:#666;font-size:11px;margin-top:5px;line-height:1.5}"
         ".hide{display:none}"
+        /* A meter is a filled bar with a tick where the threshold sits, so the
+           question "is this sound close to firing" is answered by looking
+           rather than by comparing two numbers. */
+        ".mt{position:relative;height:18px;border-radius:4px;background:#1d1d1d;"
+        "border:1px solid #333;overflow:hidden;margin-top:6px}"
+        ".mt i{position:absolute;left:0;top:0;bottom:0;background:#2ecc71;"
+        "transition:width .3s}"
+        ".mt u{position:absolute;top:-2px;bottom:-2px;width:2px;"
+        "background:#ff3b30;text-decoration:none}"
+        ".mt.over i{background:#ff3b30}"
+        ".rd{display:flex;justify-content:space-between;align-items:baseline;"
+        "font:12px ui-monospace,monospace;color:#888;margin-top:5px}"
+        ".rd b{color:#eee;font-size:15px;font-weight:600}"
+        "input[type=range]{width:100%;margin:10px 0 0;accent-color:#2ecc71}"
+        ".sv{color:#2ecc71;font:600 13px ui-monospace,monospace}"
         "</style></head><body>"
         "<header>저수조 모니터</header>"
         "<nav><button id=\"tl\" class=\"a\">LIVE</button>"
-        "<button id=\"tc\">CONFIG</button></nav>"
+        "<button id=\"tn\">NETWORK</button>"
+        "<button id=\"tm\">MIC / CAM</button></nav>"
 
         "<div id=\"live\">"
         "<div class=\"s\"><span>RUN</span><div id=\"r\" class=\"bar\"></div>"
@@ -368,7 +459,7 @@ static void send_page(uint8_t sn)
         "<p class=\"n\" id=\"note\"></p>"
         "</div>"
 
-        "<div id=\"cfg\" class=\"hide\">"
+        "<div id=\"net\" class=\"hide\">"
         "<div class=\"f\"><label>주소 방식</label>"
         "<div class=\"rs\">"
         "<button id=\"m1\">DHCP <small>자동</small></button>"
@@ -386,6 +477,49 @@ static void send_page(uint8_t sn)
         "<div class=\"f row\">"
         "<div><label>외부 IP</label><input id=\"ph\"></div>"
         "<div><label>외부 포트</label><input id=\"pp\"></div></div>"
+        "<div class=\"f\"><label>Discord Webhook URL</label>"
+        "<input id=\"wh\" autocomplete=\"off\">"
+        "<div class=\"h\" id=\"whs\"></div></div>"
+        "<div class=\"act\"><button id=\"ref\">REFRESH</button>"
+        "<button id=\"save\">SAVE</button></div>"
+        "<div id=\"msg\"></div>"
+        "</div>"
+
+        /* ------------------------------------------------- mic / camera ---
+           Two meters above two sliders, and the meters update once a second
+           whether or not anything is being adjusted.
+           A threshold is not a number somebody can pick from a manual - it is
+           the gap between what this room sounds like and what its buzzer sounds
+           like, and nobody knows that gap until they stand in the room and look
+           at it. So the panel shows the live value, marks where the threshold
+           sits, and lets the slider move the mark. */
+        "<div id=\"mic\" class=\"hide\">"
+
+        "<div class=\"f\"><label>음량 — 평소 대비 몇 배</label>"
+        "<div class=\"mt\" id=\"lm\"><i id=\"lf\"></i><u id=\"lt\"></u></div>"
+        "<div class=\"rd\"><span>지금 <b id=\"lv\">-</b> 배</span>"
+        "<span id=\"ldb\">-</span></div>"
+        "<input type=\"range\" id=\"ls\" min=\"1.2\" max=\"6\" step=\"0.1\">"
+        "<div class=\"h\">경보 기준 <span class=\"sv\" id=\"lsv\">-</span> 배 "
+        "&nbsp;·&nbsp; 빨간 선이 기준입니다. 부저를 울렸을 때 막대가 선을 "
+        "넘고, 조용할 때 넘지 않는 자리로 맞추세요.</div></div>"
+
+        "<div class=\"f\"><label>음조성 — 한 주파수가 얼마나 도드라지나</label>"
+        "<div class=\"mt\" id=\"tm\"><i id=\"tf\"></i><u id=\"tt\"></u></div>"
+        "<div class=\"rd\"><span>지금 <b id=\"tv\">-</b></span>"
+        "<span id=\"thz\">-</span></div>"
+        "<input type=\"range\" id=\"ts\" min=\"5\" max=\"60\" step=\"1\">"
+        "<div class=\"h\">경보 기준 <span class=\"sv\" id=\"tsv\">-</span> "
+        "&nbsp;·&nbsp; 삐- 하는 맑은 소리에 반응합니다. 넓게 퍼지는 소리에는 "
+        "오르지 않으니, 그런 부저라면 위의 음량 쪽으로 맞추세요.</div></div>"
+
+        "<p class=\"n\">마이크 입력 <b id=\"blk\">-</b> "
+        "<small>(정상이면 62 blk/s 근처입니다. 0이면 마이크를 못 읽는 중입니다.)"
+        "</small></p>"
+        "<p class=\"n\">두 기준 중 <b>하나만 넘어도 경보</b>입니다. "
+        "슬라이더는 움직이는 즉시 반영되고, 재시작 후에도 유지하려면 "
+        "아래 SAVE를 누르세요.</p>"
+
         "<div class=\"f\"><label>카메라 해상도</label>"
         "<div class=\"rs\">"
         "<button id=\"r1\">QVGA <small>320&times;240</small></button>"
@@ -394,13 +528,12 @@ static void send_page(uint8_t sn)
         "<div class=\"h\">누르면 바로 적용됩니다. 재시작 후에도 그 해상도로 "
         "올라오게 하려면 SAVE 하세요. 해상도가 높을수록 한 장을 찍어 보내는 "
         "시간이 길어져 영상이 느려집니다.</div></div>"
-        "<div class=\"f\"><label>Discord Webhook URL</label>"
-        "<input id=\"wh\" autocomplete=\"off\">"
-        "<div class=\"h\" id=\"whs\"></div></div>"
-        "<div class=\"act\"><button id=\"ref\">REFRESH</button>"
-        "<button id=\"save\">SAVE</button></div>"
-        "<div id=\"msg\"></div>"
+
+        "<div class=\"act\"><button id=\"ref2\">REFRESH</button>"
+        "<button id=\"save2\">SAVE</button></div>"
+        "<div id=\"msg2\"></div>"
         "</div>"
+
         "<script>");
 
     /* The token and the stand-down time are the two things the page cannot
@@ -416,7 +549,7 @@ static void send_page(uint8_t sn)
     }
 
     send_str(sn,
-        "var live=1,RES=1;"
+        "var live=1,tabn=0,RES=1,armed=0;"
         "function q(i){return document.getElementById(i)}"
 
         /*
@@ -468,25 +601,70 @@ static void send_page(uint8_t sn)
         "q('r1').onclick=function(){pickRes(1)};"
         "q('r2').onclick=function(){pickRes(2)};"
         "q('r3').onclick=function(){pickRes(3)};"
-        "function tab(l){live=l;"
-        "q('tl').className=l?'a':'';q('tc').className=l?'':'a';"
-        "q('live').className=l?'':'hide';q('cfg').className=l?'hide':'';"
-        "if(!l)loadCfg();}"
-        "q('tl').onclick=function(){tab(1)};"
-        "q('tc').onclick=function(){tab(0)};"
+        /* Three tabs now. `live` still means "the video is on screen", which
+           is what decides whether the stream element exists; `tabn` is which
+           panel is showing. The microphone tab keeps polling even though the
+           video is hidden, because its meters are the whole point of it. */
+        "function tab(n){tabn=n;live=(n==0);"
+        "q('tl').className=n==0?'a':'';q('tn').className=n==1?'a':'';"
+        "q('tm').className=n==2?'a':'';"
+        "q('live').className=n==0?'':'hide';"
+        "q('net').className=n==1?'':'hide';"
+        "q('mic').className=n==2?'':'hide';"
+        "if(n==1)loadCfg();}"
+        "q('tl').onclick=function(){tab(0)};"
+        "q('tn').onclick=function(){tab(1)};"
+        "q('tm').onclick=function(){tab(2)};"
 
         /* Polling stops while the config tab is open. Nothing on that tab shows
          * live state, and a request every second would compete for the same
          * four sockets as the save. */
-        "function poll(){if(!live)return;"
+        /* The network tab is the only one that stops polling: nothing on it
+           moves, and a request a second would compete with the save for the
+           same six sockets. */
+        "function poll(){if(tabn==1)return;"
         "fetch('/api/status?t='+T,{cache:'no-store'}).then(function(r){"
         "return r.json()}).then(function(s){"
         "q('r').className='bar on-run';q('rv').textContent=s.up+'s';"
         "q('b').className=s.buzzer?'bar on-buz':'bar';"
         "q('bv').textContent=s.buzzer?(s.hz+'Hz'):('tone '+s.tone);"
         "q('note').textContent=s.buzzer?NOTE:'';"
+        "meters(s);"
         "}).catch(function(){q('r').className='bar';"
         "q('rv').textContent='응답 없음';});}"
+
+        /* Both meters are drawn the same way: the bar is the live value as a
+           share of the scale, and the tick is the threshold on that same scale.
+           Keeping the scale a little above the threshold means the tick never
+           sits at the very edge, where it would be impossible to judge. */
+        "function meter(bar,fill,tick,val,thr,scale){"
+        "var w=Math.max(0,Math.min(100,val/scale*100));"
+        "q(fill).style.width=w+'%';"
+        "q(tick).style.left=Math.min(100,thr/scale*100)+'%';"
+        "q(bar).className=val>=thr?'mt over':'mt';}"
+
+        "function meters(s){"
+        "if(!armed){q('ls').value=s.loud;q('ts').value=s.enter;armed=1;}"
+        "var lthr=parseFloat(q('ls').value),tthr=parseFloat(q('ts').value);"
+        "q('lsv').textContent=lthr.toFixed(1);"
+        "q('tsv').textContent=tthr.toFixed(0);"
+        "q('lv').textContent=s.x.toFixed(1);"
+        "q('tv').textContent=s.tone.toFixed(1);"
+        "q('ldb').textContent=s.db.toFixed(0)+' dB  (평소 '+s.basedb.toFixed(0)+' dB)';"
+        "q('thz').textContent=s.hz+' Hz';"
+        "q('blk').textContent=s.blk+' blk/s';"
+        "q('blk').style.color=s.blk>40?'#2ecc71':'#ff3b30';"
+        "meter('lm','lf','lt',s.x,lthr,Math.max(lthr*1.6,4));"
+        "meter('tm','tf','tt',s.tone,tthr,Math.max(tthr*1.6,20));}"
+
+        /* Sent on release rather than on every pixel of the drag: each one is a
+           request, and the board has six sockets. */
+        "function pushMic(){q('msg2').textContent='적용 중...';"
+        "fetch('/api/mic?loud='+q('ls').value+'&enter='+q('ts').value+'&t='+T)"
+        ".then(function(r){return r.text()}).then(function(t){"
+        "q('msg2').textContent=t+' — 재시작 후에도 쓰려면 SAVE 하세요.';})"
+        ".catch(function(){q('msg2').textContent='적용 실패';});}"
+        "q('ls').onchange=pushMic;q('ts').onchange=pushMic;"
 
         "function loadCfg(){"
         "fetch('/api/config?t='+T,{cache:'no-store'}).then(function(r){"
@@ -504,20 +682,34 @@ static void send_page(uint8_t sn)
         "q('ref').onclick=function(){q('msg').textContent='불러오는 중...';"
         "loadCfg();};"
 
-        "q('save').onclick=function(){"
+        /* Both tabs save the whole settings block, because it is one record in
+           flash and a partial write is not a thing. Which button was pressed
+           only decides which line the answer appears on. */
+        "function doSave(where){"
         "var p=['ip','sn','gw','dns','port','ph','pp','wh'].map(function(k){"
         "return k+'='+encodeURIComponent(q(k).value)}).join('&')"
-        "+'&res='+RES+'&dhcp='+MODE;"
-        "q('msg').textContent='저장 중...';"
+        "+'&res='+RES+'&dhcp='+MODE"
+        "+'&loud='+q('ls').value+'&enter='+q('ts').value;"
+        "q(where).textContent='저장 중...';"
         "fetch('/api/save?t='+T,{method:'POST',body:p}).then(function(r){"
-        "return r.text()}).then(function(t){q('msg').textContent=t;"
+        "return r.text()}).then(function(t){q(where).textContent=t;"
         /* The board restarts after a save because the address it listens on is
          * one of the things being changed. Saying so beats a page that simply
          * stops answering. */
-        "}).catch(function(){q('msg').textContent="
-        "'전송 실패 - 이미 재시작했을 수 있습니다.';});};"
+        "}).catch(function(){q(where).textContent="
+        "'전송 실패 - 이미 재시작했을 수 있습니다.';});}"
+        "q('save').onclick=function(){doSave('msg')};"
+        "q('save2').onclick=function(){doSave('msg2')};"
+        "q('ref2').onclick=function(){armed=0;q('msg2').textContent="
+        "'보드에 저장된 값을 다시 읽었습니다.';};"
 
-        "startStream();loadCfg();poll();setInterval(poll,1000);"
+        /* Three times a second while the meters are on screen, once a second
+           otherwise. Adjusting a threshold means making a noise and watching
+           the bar answer, and a bar that answers a second later cannot be aimed
+           with. */
+        "function beat(){poll();"
+        "setTimeout(beat,tabn==2?300:1000);}"
+        "startStream();loadCfg();beat();"
         "</script></body></html>");
 }
 
@@ -525,14 +717,50 @@ static void send_page(uint8_t sn)
 
 static void send_status(uint8_t sn)
 {
-    static char body[224];
+    static char body[384];
     static char hdr[128];
+
+    /*
+     * Level as dBFS, because that is the unit anybody adjusting a microphone
+     * already thinks in - a bare 0.0043 means nothing to read off a screen.
+     * Full scale is 0 dB, so a quiet room lands near -47 and the buzzer near
+     * -38. The ratio against the learned background is sent as well, since that
+     * is the number the threshold is actually compared with.
+     */
+    float rms  = s_peak_rms;
+    float tone = s_peak_tone;
+    int   hz   = s_peak_hz;
+    float base = s_base > 0.0f ? s_base : 0.0001f;
+    float db   = (rms > 0.0000001f) ? 20.0f * log10f(rms) : -99.0f;
+    float bdb  = 20.0f * log10f(base);
+
+    /* Cleared on read, so the next window starts from nothing. */
+    s_peak_rms  = 0.0f;
+    s_peak_tone = 0.0f;
+
+    /*
+     * How many blocks the detector has seen. A panel that shows a level of zero
+     * cannot say whether the room is silent or the microphone is not being read
+     * at all - two very different faults that look identical. This number moving
+     * is the difference.
+     */
+    static uint32_t last_blocks;
+    static uint32_t last_ms;
+    uint32_t span = now_ms() - last_ms;
+    uint32_t bps  = span ? (s_blocks - last_blocks) * 1000u / span : 0;
+    last_blocks = s_blocks;
+    last_ms     = now_ms();
 
     int n = snprintf(body, sizeof(body),
         "{\"run\":1,\"buzzer\":%d,\"stream\":1,\"hz\":%d,"
-        "\"tone\":%.1f,\"up\":%lu}",
-        s_alarm ? 1 : 0, s_hz, (double)s_tone,
-        (unsigned long)(now_ms() / 1000u));
+        "\"tone\":%.1f,\"up\":%lu,"
+        "\"db\":%.1f,\"basedb\":%.1f,\"x\":%.2f,"
+        "\"loud\":%.2f,\"enter\":%.0f,\"blk\":%lu}",
+        s_alarm ? 1 : 0, hz, (double)tone,
+        (unsigned long)(now_ms() / 1000u),
+        (double)db, (double)bdb, (double)(rms / base),
+        (double)s_loud_k, (double)s_enter,
+        (unsigned long)bps);
 
     int h = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -700,6 +928,15 @@ static void handle_save(uint8_t sn, const char *body)
         s.use_dhcp = (atoi(v) != 0) ? 1 : 0;
     }
 
+    if (form_get(body, "loud", v, sizeof(v))) {
+        float f = (float)atof(v);
+        if (f >= 1.2f && f <= 8.0f) s.loud_k = f;
+    }
+    if (form_get(body, "enter", v, sizeof(v))) {
+        float f = (float)atof(v);
+        if (f >= 5.0f && f <= 80.0f) s.enter_ratio = f;
+    }
+
     if (form_get(body, "wh", v, sizeof(v))) {
         strncpy(s.webhook, v, SETTINGS_WEBHOOK_MAX - 1);
         s.webhook[SETTINGS_WEBHOOK_MAX - 1] = '\0';
@@ -770,7 +1007,11 @@ static bool stream_pump(uint8_t sn, conn_t *c)
         if (now_ms() - c->last_frame_ms < STREAM_MIN_INTERVAL_MS) return true;
         c->last_frame_ms = now_ms();
 
+        uint64_t t0 = time_us_64();
         uint32_t len = capture();
+        s_fr_cap_this = time_us_64() - t0;
+        s_fr_start_us = t0;
+
         if (len == 0) return true;  /* a dropped frame is not a dead client */
 
         int n = snprintf(part, sizeof(part),
@@ -802,6 +1043,30 @@ static bool stream_pump(uint8_t sn, conn_t *c)
 
     c->tx_p    += n;
     c->tx_left -= (uint32_t)n;
+
+    if (c->tx_left == 0) {
+        uint64_t frame_us = time_us_64() - s_fr_start_us;
+
+        s_fr_count++;
+        s_fr_cap_us  += s_fr_cap_this;
+        s_fr_send_us += (frame_us > s_fr_cap_this) ? frame_us - s_fr_cap_this : 0;
+        s_fr_bytes   += (uint32_t)(c->tx_p - image_buff);
+
+        if (now_ms() - s_fr_report_ms >= 2000) {
+            uint32_t span = now_ms() - s_fr_report_ms;
+
+            printf("[cam] %.1f fps   capture %lu ms   send %lu ms   "
+                   "frame %lu KB\n",
+                   (double)s_fr_count * 1000.0 / (double)span,
+                   (unsigned long)(s_fr_cap_us  / 1000u / s_fr_count),
+                   (unsigned long)(s_fr_send_us / 1000u / s_fr_count),
+                   (unsigned long)(s_fr_bytes / s_fr_count / 1024u));
+
+            s_fr_count = 0; s_fr_bytes = 0;
+            s_fr_cap_us = 0; s_fr_send_us = 0;
+            s_fr_report_ms = now_ms();
+        }
+    }
 
     return (getSn_SR(sn) == SOCK_ESTABLISHED);
 }
@@ -838,6 +1103,24 @@ static void handle_request(uint8_t sn, conn_t *c, char *req)
                      "charset=utf-8\r\nConnection: close\r\n\r\n");
         send_str(sn, ok ? settings_res_name(g_set.res)
                         : "해상도 변경 실패");
+        return;
+    }
+
+    if (strncmp(path, "/api/mic", 8) == 0) {
+        /*
+         * Applied immediately and not stored. Somebody is watching a meter
+         * while they drag a slider, and a value that only took effect after a
+         * restart would make that impossible. SAVE is what makes it survive a
+         * power cut.
+         */
+        const char *l = strstr(path, "loud=");
+        const char *t = strstr(path, "enter=");
+
+        mic_set_thresholds(l ? (float)atof(l + 5) : 0.0f,
+                           t ? (float)atof(t + 6) : 0.0f);
+
+        send_str(sn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; "
+                     "charset=utf-8\r\nConnection: close\r\n\r\n적용됨");
         return;
     }
 
@@ -964,10 +1247,19 @@ void webserver_init(void)
 void webserver_set_alarm(bool in_alarm) { s_alarm = in_alarm; }
 bool webserver_streaming(void)          { return s_alarm; }
 
-void webserver_set_detail(int hz, float tone)
+void webserver_set_detail(int hz, float tone, float rms, float baseline,
+                          float loud_k, float enter_ratio)
 {
-    s_hz   = hz;
-    s_tone = tone;
+    s_hz     = hz;
+    s_tone   = tone;
+    s_rms    = rms;
+    s_base   = baseline;
+    s_loud_k = loud_k;
+    s_enter  = enter_ratio;
+
+    s_blocks++;
+    if (rms  > s_peak_rms)  s_peak_rms  = rms;
+    if (tone > s_peak_tone) { s_peak_tone = tone; s_peak_hz = hz; }
 }
 
 void webserver_poll(void)

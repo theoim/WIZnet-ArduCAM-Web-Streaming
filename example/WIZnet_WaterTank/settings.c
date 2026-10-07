@@ -11,6 +11,14 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 
+#ifndef USE_CORE1
+#define USE_CORE1 0
+#endif
+
+#if USE_CORE1
+#include "pico/multicore.h"
+#endif
+
 #include "settings.h"
 #include "config.h"
 
@@ -22,7 +30,8 @@
  * someone enters from a phone that is cheaper than a migration path nobody will
  * exercise again.
  */
-#define SETTINGS_VERSION  3
+/* 4: the two detector thresholds joined the struct. */
+#define SETTINGS_VERSION  4
 
 /*
  * The last sector of flash.
@@ -140,6 +149,8 @@ void settings_defaults(settings_t *s)
     s->http_port = HTTP_PORT;
     s->res       = CAM_RES_DEFAULT;
     s->use_dhcp  = NET_USE_DHCP;
+    s->loud_k      = DETECT_LOUD_K;
+    s->enter_ratio = DETECT_ENTER_RATIO;
     s->build_id  = settings_build_id();
 
     /*
@@ -250,10 +261,31 @@ bool settings_save(const settings_t *in)
      * asked for, and it is why saving is a button rather than something that
      * happens on its own.
      */
+#if USE_CORE1
+    /*
+     * The other core has to be parked, not merely interrupted.
+     *
+     * Erasing takes the whole XIP window away, and core 0 is executing from it.
+     * Disabling interrupts says nothing to a second core that is in the middle
+     * of fetching an instruction - it would fetch from flash that cannot answer,
+     * and the board would stop with nothing on the console to say why. The
+     * lockout holds core 0 in a known place inside RAM until the write is done.
+     *
+     * It costs core 0 the few tens of milliseconds the erase takes, which the
+     * overrun counter will report as lost audio. That is the correct trade for
+     * something a person deliberately pressed.
+     */
+    multicore_lockout_start_blocking();
+#endif
+
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(SETTINGS_OFFSET, FLASH_SECTOR_SIZE);
     flash_range_program(SETTINGS_OFFSET, page, SETTINGS_PAGES);
     restore_interrupts(ints);
+
+#if USE_CORE1
+    multicore_lockout_end_blocking();
+#endif
 
     const settings_t *f = (const settings_t *)(XIP_BASE + SETTINGS_OFFSET);
     if (memcmp(f, &s, sizeof(s)) != 0) {

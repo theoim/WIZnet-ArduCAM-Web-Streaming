@@ -60,6 +60,17 @@
 #include "arducam_mega.h"
 #include "i2s_rx.pio.h"
 
+#ifndef USE_CORE1
+#define USE_CORE1 0
+#endif
+
+#if USE_CORE1
+#include "pico/multicore.h"
+#include "xcore.h"
+
+xcore_t g_xc;
+#endif
+
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/irq.h"
@@ -186,6 +197,10 @@ static void audio_init(void)
      * send an alert for each. */
     s_det.cfg.clear_blocks =
         (uint32_t)(CLEAR_SECONDS * SAMPLE_RATE / FRAMES_PER_BUF);
+
+    /* Whatever the panel last stored wins over the compile-time defaults. */
+    s_det.cfg.loud_k      = g_set.loud_k;
+    s_det.cfg.enter_ratio = g_set.enter_ratio;
 }
 
 /* ------------------------------------------------------- audio accounting */
@@ -238,21 +253,64 @@ static void led_init(void)
 }
 
 /*
- * RUN is a heartbeat rather than a steady lamp. A lamp that is simply on says
- * the board has power; one that blinks says the loop is still turning, which is
- * the question someone standing at the box actually has.
+ * What the RUN lamp is saying.
+ *
+ * The person who installs this box does not have a laptop, does not know what
+ * DHCP is, and will not read a console. The lamp is the only thing they can
+ * read, so it has to carry the one question they can act on: is this working,
+ * and if not, is it the cable, the router, or the internet?
+ *
+ * Three faults, three answers, and each one has a different person to call.
+ */
+#define NET_OK          0
+#define NET_NO_LINK     2   /* cable, switch port */
+#define NET_NO_ADDRESS  3   /* link, but the router gave nothing */
+#define NET_NO_INTERNET 4   /* address, but names do not resolve */
+
+static volatile uint8_t s_net_fault = NET_NO_LINK;
+
+/*
+ * RUN is a heartbeat while all is well - a steady lamp says the board has
+ * power, a blinking one says the loop is still turning, which is the question
+ * someone standing at the box actually has.
+ *
+ * When something is wrong it counts instead: two blinks, pause, two blinks.
+ * Counting is readable from across a room by somebody who was handed a card
+ * with three lines on it, which is the whole design brief for this lamp.
  */
 static void led_run_tick(void)
 {
     static uint32_t next_ms;
     static bool     on;
+    static uint8_t  step;       /* position in the blink pattern */
 
     uint32_t t = to_ms_since_boot(get_absolute_time());
     if (t < next_ms) return;
 
-    on = !on;
-    gpio_put(PIN_LED_RUN, on);
-    next_ms = t + 500;
+    uint8_t fault = s_net_fault;
+
+    if (fault == NET_OK) {
+        on   = !on;
+        step = 0;
+        gpio_put(PIN_LED_RUN, on);
+        next_ms = t + 500;
+        return;
+    }
+
+    /* fault * 2 steps of blinking, then a gap of four steps. */
+    uint8_t total = (uint8_t)(fault * 2 + 4);
+
+    if (step < fault * 2) {
+        on = (step % 2) == 0;
+        gpio_put(PIN_LED_RUN, on);
+        next_ms = t + 160;
+    } else {
+        gpio_put(PIN_LED_RUN, 0);
+        next_ms = t + 220;
+    }
+
+    step++;
+    if (step >= total) step = 0;
 }
 
 /*
@@ -288,6 +346,95 @@ static bool tick_1s(struct repeating_timer *t)
     (void)t;
     wiz_claw_net_1s_tick();
     return true;
+}
+
+/* -------------------------------------------------------------- link state */
+
+/*
+ * What the cable is doing, printed in words.
+ *
+ * Everything that went wrong on the first site visit looked the same from the
+ * console: DHCP gave up, then DNS timed out, and the obvious reading was "the
+ * network does not like us". A link that is down produces exactly that, and so
+ * does a wrong subnet, and so does a site with no DHCP server - three different
+ * problems, one symptom, and nothing on screen to tell them apart.
+ *
+ * The W6300 knows which it is. PHYSR carries the link bit, the negotiated speed
+ * and duplex, and a cable-fault bit; reading it costs one register access and
+ * removes the guesswork.
+ */
+static void print_link(void)
+{
+    uint8_t sr = getPHYSR();
+
+    printf("link       : %s", (sr & PHYSR_LNK) ? "UP" : "DOWN");
+    if (sr & PHYSR_LNK) {
+        printf("  %s  %s",
+               (sr & PHYSR_SPD) ? "10 Mbps" : "100 Mbps",
+               (sr & PHYSR_DPX) ? "half duplex" : "full duplex");
+    }
+    if (sr & PHYSR_CAB) printf("  [cable fault]");
+    printf("\n");
+}
+
+/*
+ * Wait for the cable, within reason.
+ *
+ * A board powered up before its switch, or plugged in while it was booting, has
+ * no link when DHCP runs - and DHCP then fails for a reason that has nothing to
+ * do with DHCP. Ten seconds covers a switch negotiating; beyond that it is not
+ * a timing problem and saying so is more use than waiting longer.
+ *
+ * @return true if the link came up.
+ */
+static bool wait_for_link(uint32_t timeout_ms)
+{
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+
+    if (wizphy_getphylink() == PHY_LINK_ON) {
+        print_link();
+        return true;
+    }
+
+    printf("waiting for the cable ...\n");
+
+    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+        if (wizphy_getphylink() == PHY_LINK_ON) {
+            printf("link came up after %lu ms\n",
+                   (unsigned long)(to_ms_since_boot(get_absolute_time()) - start));
+            print_link();
+            return true;
+        }
+        sleep_ms(250);
+    }
+
+    print_link();
+    printf("NO LINK - check the cable, the switch port and that the port is "
+           "not disabled.\n"
+           "          DHCP and DNS will both fail from here, and neither "
+           "failure is the cause.\n");
+    return false;
+}
+
+/* The startup announcement. At file scope because on the dual-core image it is
+ * written here and sent from core 1. */
+static char s_boot_msg[256];
+
+/*
+ * Called from the web server, which is core 1, into the detector, which core 0
+ * is reading. Two aligned float stores and no other state changes with them, so
+ * the worst a race can do is apply one threshold a block before the other.
+ *
+ * Live rather than at the next boot, because the whole point is that somebody
+ * watches the meters move while they turn the knob.
+ */
+void mic_set_thresholds(float loud_k, float enter_ratio)
+{
+    if (loud_k      > 0.0f) s_det.cfg.loud_k      = loud_k;
+    if (enter_ratio > 0.0f) s_det.cfg.enter_ratio = enter_ratio;
+
+    printf("[mic] thresholds now  level %.1fx  tone %.0f\n",
+           (double)s_det.cfg.loud_k, (double)s_det.cfg.enter_ratio);
 }
 
 /* ------------------------------------------------------------------ alerts */
@@ -345,6 +492,81 @@ static void alert_clear(float peak_ratio)
     discord_post_text(g_set.webhook, msg);
     loss_mark("the stand-down message");
 }
+
+#if USE_CORE1
+/* ----------------------------------------------------------------- core 1 */
+
+/*
+ * Everything that is allowed to wait.
+ *
+ * It lives in this file rather than its own because the work it does - posting
+ * an alert, driving the run lamp - is written above as static functions, and
+ * exporting them only to split the file would widen their reach for no gain.
+ * What keeps the two halves apart is not which file they are in; it is that
+ * this function touches nothing core 0 owns. The microphone, the Goertzel bank
+ * and the detector are not mentioned below, and the only traffic between the
+ * cores is the fields in xcore.h.
+ */
+void core1_main(void)
+{
+    uint32_t next_tick = to_ms_since_boot(get_absolute_time()) + 1000;
+
+    while (true) {
+        webserver_poll();
+        led_run_tick();
+
+        /*
+         * The second that DNS and DHCP count in. It used to be a repeating
+         * timer, which ran it on core 0 - the core that no longer speaks to the
+         * network at all.
+         */
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((int32_t)(now - next_tick) >= 0) {
+            wiz_claw_net_1s_tick();
+            next_tick = now + 1000;
+
+            /*
+             * The cable can be pulled long after boot, and a box that was
+             * healthy at startup should not keep claiming to be. Only the link
+             * is re-checked here: re-running DNS once a second to keep a lamp
+             * honest would cost more than the lamp is worth.
+             */
+            if (wizphy_getphylink() != PHY_LINK_ON) {
+                s_net_fault = NET_NO_LINK;
+            } else if (s_net_fault == NET_NO_LINK) {
+                s_net_fault = NET_NO_ADDRESS;   /* back, but unproven */
+            }
+        }
+
+        /*
+         * The alert, sent here rather than where the buzzer was heard.
+         *
+         * Taking the photo is about a tenth of a second and posting it is six to
+         * eight, and for all of that the web server stops answering - the live
+         * view does freeze while an alert goes out. That is a far smaller
+         * problem than the microphone stopping, which is why the split is this
+         * way round and not the other.
+         */
+        g_xc.laps++;
+
+        if (g_xc.boot_pending) {
+            g_xc.boot_pending = false;
+            discord_post_text(g_set.webhook, s_boot_msg);
+            loss_mark("the startup message");
+        }
+
+        if (g_xc.alarm_pending) {
+            g_xc.alarm_pending = false;
+            alert_alarm(g_xc.hz, g_xc.tone);
+        }
+
+        if (g_xc.clear_pending) {
+            g_xc.clear_pending = false;
+            alert_clear(g_xc.peak_ratio);
+        }
+    }
+}
+#endif /* USE_CORE1 */
 
 /* ------------------------------------------------------------------- main */
 
@@ -450,7 +672,21 @@ int main(void)
      * webhook that stopped working. */
     memcpy(ncfg.dns_server_ip, g_set.dns, 4);
     wiz_claw_net_init(&ncfg);
+
+#if USE_CORE1
+    /*
+     * No repeating timer here. Its callback would run on core 0 - the pool is
+     * created by whichever core registers it - while the DNS and DHCP state it
+     * advances belongs to core 1. Core 1 calls the tick from its own loop
+     * instead, which is the same once a second and on the right core.
+     */
+#else
     add_repeating_timer_ms(-1000, tick_1s, NULL, &g_1s);
+#endif
+
+    /* Before anything is asked of the network, say whether there is one. */
+    bool link_up = wait_for_link(10000);
+    s_net_fault = link_up ? NET_NO_ADDRESS : NET_NO_LINK;
 
     memcpy(g_net.ip,  g_set.ip,  4);
     memcpy(g_net.sn,  g_set.sn,  4);
@@ -506,15 +742,109 @@ int main(void)
     printf("address from %s\n",
            g_set.use_dhcp ? (dhcp_ok ? "DHCP" : "DHCP failed, stored fallback")
                           : "stored settings");
+    print_link();
+
+    /*
+     * Which resolver to ask.
+     *
+     * The stored one is tried first, then the gateway, then a public server.
+     * This is not belt and braces - it is the single most common difference
+     * between one site and the next. A DNS address learned from one building's
+     * DHCP is meaningless in another, and plenty of networks answer only on the
+     * router and drop traffic to anything outside. Carrying the previous site's
+     * resolver into this one is how a box that worked yesterday resolves nothing
+     * today, with every other part of it healthy.
+     */
+    if (link_up) {
+        static const uint8_t public_dns[4] = { 8, 8, 8, 8 };
+        const uint8_t *candidates[3] = { g_set.dns, g_net.gw, public_dns };
+        const char   *names[3]       = { "stored", "gateway", "8.8.8.8" };
+        uint8_t       resolved[4];
+        bool          dns_ok = false;
+
+        for (int i = 0; i < 3 && !dns_ok; i++) {
+            /* Skip a candidate that is the same as one already tried. */
+            if (i > 0 && memcmp(candidates[i], candidates[0], 4) == 0) continue;
+
+            printf("DNS test via %s (%u.%u.%u.%u) ... ", names[i],
+                   candidates[i][0], candidates[i][1],
+                   candidates[i][2], candidates[i][3]);
+
+            memcpy(ncfg.dns_server_ip, candidates[i], 4);
+            wiz_claw_net_init(&ncfg);
+
+            if (wiz_claw_net_dns_resolve("discord.com", resolved) == WIZ_CLAW_OK) {
+                printf("ok -> %u.%u.%u.%u\n",
+                       resolved[0], resolved[1], resolved[2], resolved[3]);
+                dns_ok = true;
+            } else {
+                printf("no answer\n");
+            }
+        }
+
+        s_net_fault = dns_ok ? NET_OK : NET_NO_INTERNET;
+
+        if (!dns_ok) {
+            printf("NO DNS - the box has a link and an address but cannot "
+                   "resolve a name.\n"
+                   "         Alerts will fail. Check that this network reaches "
+                   "the internet,\n"
+                   "         and that the gateway above is right for this "
+                   "subnet.\n");
+        }
+    }
 
     webserver_init();
 
     printf("microphone ...\n");
     audio_init();
 
+#if USE_CORE1
+    /*
+     * Core 0 has to agree to be stopped before core 1 can write flash. Erasing a
+     * sector takes the whole XIP window away, and core 0 runs from it - without
+     * this, the first SAVE from the settings panel would fetch an instruction
+     * from flash that is not readable, with no message left behind.
+     */
+    multicore_lockout_victim_init();
+
+    /*
+     * Core 1's stack, 16 KB of ordinary RAM.
+     *
+     * Not the SDK's default: that one lives in SCRATCH_X and is 2 KB, while core
+     * 0's stack pointer starts at the top of SCRATCH_Y and has 4 KB. The two
+     * cores are not symmetric, and the core that got less is the one running
+     * mbedTLS.
+     */
+    /*
+     * Eight-byte aligned, which a uint32_t array is not guaranteed to be.
+     *
+     * The procedure call standard puts doubles on an eight-byte boundary when
+     * they go through varargs. A stack that starts four bytes out shifts every
+     * double in a printf, and shifts every argument after it too - so the
+     * symptom is not a wrong number, it is a message where the frequency reads
+     * 0, the ratio reads 3e+154 and the host and port that follow are garbage.
+     *
+     * mbedTLS barely touches doubles, so the TLS client ran on a misaligned
+     * stack without complaint. The alarm message was what found it.
+     */
+    static uint32_t core1_stack[16384 / sizeof(uint32_t)]
+        __attribute__((aligned(8)));
+
+    multicore_launch_core1_with_stack(core1_main, core1_stack,
+                                      sizeof(core1_stack));
+    printf("core 1 has the network, the camera and the alerts\n");
+    printf("core 0 has the microphone, and nothing that waits\n");
+#endif
+
     absolute_time_t next_log = make_timeout_time_ms(1000);
     absolute_time_t next_health = make_timeout_time_ms(10000);
     uint32_t blocks_done = 0;
+#if USE_CORE1
+    absolute_time_t next_beat = make_timeout_time_ms(30000);
+    uint32_t beat_blocks = 0;
+    uint32_t last_laps   = 0;
+#endif
 
     /*
      * Four figures a second, because one of them on its own misleads.
@@ -564,9 +894,7 @@ int main(void)
      * default to.
      */
     {
-        static char boot[256];
-
-        snprintf(boot, sizeof(boot),
+        snprintf(s_boot_msg, sizeof(s_boot_msg),
             "🟢 **[시스템 가동]** 저수조 부저 감시를 시작합니다.\n"
             "내부 주소 %u.%u.%u.%u:%u (%s) · 카메라 %s\n"
             "외부 접속 http://%s:%u/?t=" STREAM_TOKEN,
@@ -576,8 +904,21 @@ int main(void)
             settings_res_name(g_set.res),
             g_set.pub_host, g_set.pub_port);
 
-        discord_post_text(g_set.webhook, boot);
+#if USE_CORE1
+        /*
+         * Handed to core 1 like every other message.
+         *
+         * This one was left behind when the alerts moved, and it cost exactly
+         * what the split was meant to save: 88 buffers, 11.2 seconds of audio,
+         * on the core that is supposed to do nothing but listen. The timing line
+         * from the same post read 11574 ms - the same number, because the
+         * startup message was simply still being sent from the wrong core.
+         */
+        g_xc.boot_pending = true;
+#else
+        discord_post_text(g_set.webhook, s_boot_msg);
         loss_mark("the startup message");
+#endif
     }
 
 
@@ -631,7 +972,26 @@ int main(void)
                      * in the message already works by the time the phone buzzes. */
                     webserver_set_alarm(true);
                     led_buzzer(1.0f);
+#if USE_CORE1
+                    /*
+                     * Handed over, not done here. Taking the photo and posting
+                     * it is six to eight seconds of DNS, TLS and upload, and
+                     * this core has a microphone to read - a buzzer that beeps
+                     * twice would have its second beep land inside that gap.
+                     *
+                     * The flag is written last so core 1 cannot find it set over
+                     * half-written numbers.
+                     */
+                    g_xc.hz       = s_det.locked_hz;
+                    g_xc.tone     = s_bank.tone_ratio;
+                    g_xc.rms      = rms;
+                    g_xc.baseline = s_det.baseline;
+                    g_xc.by_loud  = s_det.by_loud;
+                    __dmb();
+                    g_xc.alarm_pending = true;
+#else
                     alert_alarm(s_det.locked_hz, s_bank.tone_ratio);
+#endif
 
                 } else if (ev == DET_EV_CLEAR) {
                     printf("\n*** CLEAR, peak was %.1f ***\n",
@@ -647,7 +1007,14 @@ int main(void)
                      */
                     webserver_set_alarm(false);
                     led_buzzer(0.0f);
+#if USE_CORE1
+                    g_xc.peak_ratio = s_det.peak_ratio;
+                    g_xc.peak_rms   = s_det.peak_rms;
+                    __dmb();
+                    g_xc.clear_pending = true;
+#else
                     alert_clear(s_det.peak_ratio);
+#endif
                 }
 
                 /* The panel carries the ratio while watching, not only during an
@@ -655,7 +1022,9 @@ int main(void)
                  * box is how close the quiet room already sits to the threshold. */
                 webserver_set_detail((int)(s_det.state == DET_ALARM
                                            ? s_det.locked_hz : s_bank.peak_hz),
-                                     s_bank.tone_ratio);
+                                     s_bank.tone_ratio,
+                                     rms, s_det.baseline,
+                                     s_det.cfg.loud_k, s_det.cfg.enter_ratio);
 
                 if (s_det.state != DET_ALARM) {
                     float p = s_bank.tone_ratio / s_det.cfg.enter_ratio;
@@ -663,6 +1032,9 @@ int main(void)
                 }
 
                 blocks_done++;
+#if USE_CORE1
+            beat_blocks++;
+#endif
 
                 /*
                  * The bar is drawn from the block that stood out most, so the column
@@ -698,8 +1070,10 @@ int main(void)
             s_ready_mask &= ~(1u << i);
         }
 
+#if !USE_CORE1
         webserver_poll();
         led_run_tick();
+#endif
 
         /*
          * One line a second, and two of the four figures are about whether the
@@ -773,6 +1147,27 @@ int main(void)
                 loss_mark("the last 10 s");
                 next_health = make_timeout_time_ms(10000);
             }
+
+#if USE_CORE1
+            /*
+             * Proof that both cores are turning, every thirty seconds.
+             *
+             * Without it a healthy board and a stopped one look identical: the
+             * per-block line is off and the loss line only prints when something
+             * is wrong, so silence means either "nothing to report" or "nothing
+             * is running". One line removes the ambiguity, and core 1's lap
+             * counter is the half that cannot be faked from here.
+             */
+            if (time_reached(next_beat)) {
+                printf("[alive] core0 %lu blk/s   core1 %lu laps/s   ovr %lu\n",
+                       (unsigned long)(beat_blocks / 30u),
+                       (unsigned long)((g_xc.laps - last_laps) / 30u),
+                       (unsigned long)s_overrun);
+                beat_blocks = 0;
+                last_laps   = g_xc.laps;
+                next_beat   = make_timeout_time_ms(30000);
+            }
+#endif
 
             blocks_done  = 0;
             win_tone     = 0.0f;

@@ -93,6 +93,21 @@ typedef struct {
      */
     uint32_t build_id;
 
+    /*
+     * The two detector thresholds, kept here so a site that needs a different
+     * one does not need a toolchain.
+     *
+     * Every room is different and the right value is the one somebody reads off
+     * the panel while the buzzer is actually sounding. Compiling them in made
+     * that a developer's job; stored here it is the commissioning engineer's,
+     * which is who is standing in the room.
+     *
+     *   loud_k       how many times the learned background counts as loud
+     *   enter_ratio  how far one frequency must stand above the rest
+     */
+    float    loud_k;
+    float    enter_ratio;
+
     uint32_t crc;           /* over everything above */
 } settings_t;
 
