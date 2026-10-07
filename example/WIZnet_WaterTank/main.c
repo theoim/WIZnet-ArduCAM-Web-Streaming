@@ -496,6 +496,25 @@ static void alert_clear(float peak_ratio)
 #if USE_CORE1
 /* ----------------------------------------------------------------- core 1 */
 
+const char *xcore_stage_name(uint8_t stage)
+{
+    switch (stage) {
+    case ST_POLL:    return "web";
+    case ST_CAPTURE: return "camera";
+    case ST_SEND:    return "send";
+    case ST_TICK:    return "tick";
+    case ST_ALERT:   return "alert";
+    case ST_SAVE:    return "flash";
+    default:         return "idle";
+    }
+}
+
+static inline void stage(uint8_t s)
+{
+    g_xc.stage    = s;
+    g_xc.stage_at = to_ms_since_boot(get_absolute_time());
+}
+
 /*
  * Everything that is allowed to wait.
  *
@@ -512,7 +531,9 @@ void core1_main(void)
     uint32_t next_tick = to_ms_since_boot(get_absolute_time()) + 1000;
 
     while (true) {
+        stage(ST_POLL);
         webserver_poll();
+        stage(ST_IDLE);
         led_run_tick();
 
         /*
@@ -522,7 +543,9 @@ void core1_main(void)
          */
         uint32_t now = to_ms_since_boot(get_absolute_time());
         if ((int32_t)(now - next_tick) >= 0) {
+            stage(ST_TICK);
             wiz_claw_net_1s_tick();
+            stage(ST_IDLE);
             next_tick = now + 1000;
 
             /*
@@ -551,18 +574,24 @@ void core1_main(void)
 
         if (g_xc.boot_pending) {
             g_xc.boot_pending = false;
+            stage(ST_ALERT);
             discord_post_text(g_set.webhook, s_boot_msg);
+            stage(ST_IDLE);
             loss_mark("the startup message");
         }
 
         if (g_xc.alarm_pending) {
             g_xc.alarm_pending = false;
+            stage(ST_ALERT);
             alert_alarm(g_xc.hz, g_xc.tone);
+            stage(ST_IDLE);
         }
 
         if (g_xc.clear_pending) {
             g_xc.clear_pending = false;
+            stage(ST_ALERT);
             alert_clear(g_xc.peak_ratio);
+            stage(ST_IDLE);
         }
     }
 }
@@ -1159,10 +1188,22 @@ int main(void)
              * counter is the half that cannot be faked from here.
              */
             if (time_reached(next_beat)) {
-                printf("[alive] core0 %lu blk/s   core1 %lu laps/s   ovr %lu\n",
+                uint32_t laps = g_xc.laps - last_laps;
+                uint32_t age  = to_ms_since_boot(get_absolute_time())
+                              - g_xc.stage_at;
+
+                printf("[alive] core0 %lu blk/s   core1 %lu laps/s   ovr %lu",
                        (unsigned long)(beat_blocks / 30u),
-                       (unsigned long)((g_xc.laps - last_laps) / 30u),
+                       (unsigned long)(laps / 30u),
                        (unsigned long)s_overrun);
+
+                /* Only when core 1 has stopped, and then say where it was. A
+                 * healthy board does not need a stage name every half minute. */
+                if (laps == 0) {
+                    printf("   STUCK in %s for %lu ms",
+                           xcore_stage_name(g_xc.stage), (unsigned long)age);
+                }
+                printf("\n");
                 beat_blocks = 0;
                 last_laps   = g_xc.laps;
                 next_beat   = make_timeout_time_ms(30000);

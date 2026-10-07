@@ -24,6 +24,15 @@ extern uint8_t image_buff[];        /* the camera driver owns this */
 /* In main.c, beside the detector it writes to. */
 void mic_set_thresholds(float loud_k, float enter_ratio);
 
+#if USE_CORE1
+#include "xcore.h"
+#define STAGE(s)  do { g_xc.stage = (s); \
+                       g_xc.stage_at = to_ms_since_boot(get_absolute_time()); \
+                  } while (0)
+#else
+#define STAGE(s)  do { } while (0)
+#endif
+
 /* --------------------------------------------------------------- per socket */
 
 typedef enum {
@@ -1007,8 +1016,10 @@ static bool stream_pump(uint8_t sn, conn_t *c)
         if (now_ms() - c->last_frame_ms < STREAM_MIN_INTERVAL_MS) return true;
         c->last_frame_ms = now_ms();
 
+        STAGE(ST_CAPTURE);
         uint64_t t0 = time_us_64();
         uint32_t len = capture();
+        STAGE(ST_POLL);
         s_fr_cap_this = time_us_64() - t0;
         s_fr_start_us = t0;
 
@@ -1029,7 +1040,10 @@ static bool stream_pump(uint8_t sn, conn_t *c)
     }
 
     uint16_t want = (c->tx_left > TX_CHUNK) ? TX_CHUNK : (uint16_t)c->tx_left;
+
+    STAGE(ST_SEND);
     int32_t  n    = send(sn, (uint8_t *)c->tx_p, want);
+    STAGE(ST_POLL);
 
     if (n < 0) return false;        /* the socket is gone */
 

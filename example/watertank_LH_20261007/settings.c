@@ -17,7 +17,6 @@
 
 #if USE_CORE1
 #include "pico/multicore.h"
-#include "xcore.h"
 #endif
 
 #include "settings.h"
@@ -31,8 +30,7 @@
  * someone enters from a phone that is cheaper than a migration path nobody will
  * exercise again.
  */
-/* 4: the two detector thresholds joined the struct. */
-#define SETTINGS_VERSION  4
+#define SETTINGS_VERSION  3
 
 /*
  * The last sector of flash.
@@ -150,8 +148,7 @@ void settings_defaults(settings_t *s)
     s->http_port = HTTP_PORT;
     s->res       = CAM_RES_DEFAULT;
     s->use_dhcp  = NET_USE_DHCP;
-    s->loud_k      = DETECT_LOUD_K;
-    s->enter_ratio = DETECT_ENTER_RATIO;
+    s->det_floor_db = DET_FLOOR_DB_DEFAULT;
     s->build_id  = settings_build_id();
 
     /*
@@ -211,8 +208,8 @@ bool settings_load(void)
     }
 
     settings_defaults(&g_set);
-    printf("[set] using built-in defaults (DHCP, %s)\n",
-           settings_res_name(g_set.res));
+    printf("[set] using built-in defaults (%s, %s)\n",
+           g_set.use_dhcp ? "DHCP" : "static", settings_res_name(g_set.res));
     return false;
 }
 
@@ -276,7 +273,6 @@ bool settings_save(const settings_t *in)
      * overrun counter will report as lost audio. That is the correct trade for
      * something a person deliberately pressed.
      */
-    g_xc.stage = ST_SAVE;
     multicore_lockout_start_blocking();
 #endif
 

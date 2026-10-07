@@ -81,16 +81,26 @@ typedef struct {
     /*
      * Where core 1 was when it was last seen.
      *
-     * A core that stops dead prints nothing, so the lap counter says it died
-     * and nothing says where. This is the cheapest answer to "where": a byte
-     * written before each call that could take a while, read by the other core,
-     * which is still running and can still print.
+     * The lap counter says core 1 died; nothing says where. This is the
+     * cheapest answer: a byte written before each call that can take a while,
+     * read by the other core, which is still running and can still print.
      *
-     * Only calls that can block get a number. A breadcrumb before every line
+     * Only calls that can block get a number - a breadcrumb before every line
      * would cost more than it tells.
      */
     volatile uint8_t  stage;
     volatile uint32_t stage_at;     /* ms, so a stuck stage shows its age */
+
+    /*
+     * The worst single pass through each stage since the last report.
+     *
+     * A stopped core is easy - the lap counter reads zero and the stage says
+     * where. A core that is merely slow is the harder case and the one that
+     * actually happened: one lap a second instead of twenty thousand, with
+     * nothing stuck and nothing to point at. Timing each stage and keeping the
+     * worst turns that into a single line naming the call and the milliseconds.
+     */
+    volatile uint32_t stage_max_ms[8];
 
     volatile float hz;              /* what fired, for the message */
     volatile float tone;
@@ -103,6 +113,7 @@ typedef struct {
 
 extern xcore_t g_xc;
 
+/** Core 1's loop. Never returns. */
 /* Where core 1 can be when it stops. */
 #define ST_IDLE      0
 #define ST_POLL      1      /* webserver_poll - sockets, page, 404s */
@@ -112,7 +123,6 @@ extern xcore_t g_xc;
 #define ST_ALERT     5      /* DNS, TLS, upload */
 #define ST_SAVE      6      /* flash erase with core 0 locked out */
 
-/** Core 1's loop. Never returns. */
 void core1_main(void);
 
 /** Name for a stage number, for the heartbeat line. */

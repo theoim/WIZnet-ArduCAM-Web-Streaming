@@ -1,0 +1,81 @@
+;
+; I2S master receiver for an INMP441 MEMS microphone.
+;
+; The state machine drives both clocks and samples the data line, so the mic is
+; a pure slave: BCLK and WS come from here, SD comes back.
+;
+;   side-set bit 0 -> BCLK   (base pin)
+;   side-set bit 1 -> WS     (base pin + 1)
+;   in pin         -> SD
+;
+; Two PIO cycles make one BCLK period: the instruction that drives BCLK high is
+; the one that samples, and the next drives it low again. 32 bits per channel,
+; 64 BCLK per frame, which is what the INMP441 expects.
+;
+; Philips I2S puts the WS transition one BCLK ahead of the MSB. That falls out
+; of the layout below: the `set` that reloads the counter is also the falling
+; edge that flips WS, and the first `in` of the next channel is the clock after
+; it.
+;
+; Each half-frame is exactly 64 cycles, so BCLK has no stretched period at the
+; channel boundary - a stretched clock there is the usual reason a mic reads as
+; silence or as a stuck value.
+
+.program i2s_rx
+.side_set 2
+
+.wrap_target
+    ; ---------------- left channel, WS low ----------------
+    set x, 30           side 0b00   ; BCLK low, WS low
+left_bit:
+    in pins, 1          side 0b01   ; BCLK high: mic presents a bit, we latch it
+    jmp x-- left_bit    side 0b00   ; BCLK low
+    in pins, 1          side 0b01   ; bit 32
+
+    ; ---------------- right channel, WS high --------------
+    set x, 30           side 0b10   ; BCLK low, WS high
+right_bit:
+    in pins, 1          side 0b11
+    jmp x-- right_bit   side 0b10
+    in pins, 1          side 0b11   ; bit 32
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+// clk_pin     : BCLK. WS must be clk_pin + 1.
+// data_pin    : SD from the microphone.
+// sample_rate : frames per second. BCLK ends up at sample_rate * 64.
+//
+// Returns the PIO clock divider actually programmed, so the caller can report
+// the sample rate the hardware really runs at rather than the one it asked for.
+static inline float i2s_rx_program_init(PIO pio, uint sm, uint offset,
+                                        uint clk_pin, uint data_pin,
+                                        uint sample_rate)
+{
+    pio_sm_config c = i2s_rx_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, data_pin);
+    sm_config_set_sideset_pins(&c, clk_pin);
+
+    // MSB first, so shift left. Autopush at 32 bits hands one channel sample to
+    // the FIFO without the CPU touching it.
+    sm_config_set_in_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // Two PIO cycles per BCLK, 64 BCLK per frame.
+    float div = (float)clock_get_hz(clk_sys) / (float)(sample_rate * 64 * 2);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_gpio_init(pio, clk_pin);
+    pio_gpio_init(pio, clk_pin + 1);
+    pio_gpio_init(pio, data_pin);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, clk_pin, 2, true);   // BCLK, WS out
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, false); // SD in
+
+    pio_sm_init(pio, sm, offset, &c);
+    return div;
+}
+%}
