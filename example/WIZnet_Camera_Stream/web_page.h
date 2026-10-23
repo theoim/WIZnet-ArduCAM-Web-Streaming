@@ -105,7 +105,7 @@ static const char HTTP_INDEX_PAGE[] =
 /* No flex on .view: a flex item defaults to min-width:auto, so an image whose
    natural width exceeds the column overflows instead of scaling down. */
 ".view{background:#000;border-radius:8px;overflow:hidden;min-height:240px}\n"
-".view img{display:block;width:100%;max-width:100%;height:auto}\n"
+".view img,.view canvas{display:block;width:100%;max-width:100%;height:auto}\n"
 
 /* --- Buttons: solid for the two actions that change state, ghost for the
        rest, so the exhibition screen has one obvious pair of controls. --- */
@@ -328,7 +328,7 @@ static const char HTTP_INDEX_PAGE[] =
    letterboxes inside a black box, so the bars are invisible - and on a
    taller screen the cap never bites and the frame really is edge to edge.
    No fixed height: the box has to be free to shrink for a 4:3 mode. */
-"#sec-view .view img{width:100%;height:100%;object-fit:contain}\n"
+"#sec-view .view img,#sec-view .view canvas{width:100%;height:100%;object-fit:contain}\n"
 /* Graphs: the numbers stay large, the traces lose the height the picture
    took. 130px still shows the shape of a drop, which is all it has to do. */
 "#sec-perf{padding:10px 14px}\n"
@@ -366,7 +366,7 @@ static const char HTTP_INDEX_PAGE[] =
    and if the device is not streaming yet, that connection sits there holding a
    pcb and producing nothing. The stream is opened from script once the first
    status reply says the device is actually sending frames. */
-"    <div class='view'><img id='view' alt='camera stream'></div>\n"
+"    <div class='view'><canvas id='view' role='img' aria-label='camera stream'></canvas></div>\n"
 "  </section>\n"
 "  <section class='card' id='sec-ctl'>\n"
 "    <h2>Control</h2>\n"
@@ -972,119 +972,120 @@ static const char HTTP_INDEX_PAGE[] =
 
    Date.now() makes the first URL of a load different from the last one, which
    is all this needed. */
+/* ---- The picture: the page reads the stream itself (Phase 1c) ----
+
+   Until 2026-10-23 the stream went into an <img>. Chrome fires `load` on a
+   multipart <img> for the first part only, so the page could not tell a live
+   picture from a frozen one: it guessed, tore the stream down every ~12 s
+   (board log "206 frames in 12 s, last sent 30 ms ago", page "1,11900"), the
+   fresh <img> showed black until its first frame, and now and then it never
+   drew at all until the page was reloaded. One corrupt JPEG part also froze
+   an <img> for good.
+
+   Now fetch() reads the multipart body, each part is cut out by its
+   Content-Length, decoded with createImageBitmap() and drawn on the canvas.
+   So the page knows exactly when a frame was drawn; a part that fails to
+   decode is counted and skipped instead of freezing the view; and during a
+   reconnect the canvas keeps the last frame, so nothing goes black. Decoding
+   keeps only the newest pending part: if the browser falls behind it drops
+   frames rather than queueing them.
+
+   seq starts from the clock: a reload must not ask for the URL the browser
+   was streaming a moment earlier (Chrome treated /stream?1 twice as the same
+   resource and alternated live and black, 2026-10). */
 "var seq=Date.now(),lastRestart=0,RESTART_COOLDOWN=12000;\n"
+"var sCtl=null,sDrawn=0,sBad=0,lastFrameAt=Date.now(),lastErr=0,ERR_COOLDOWN=3000;\n"
+"var decoding=false,pendingJpg=null,pendingCtl=null;\n"
+/* p= tells the board what the connection being replaced did: frames drawn,
+   ms since the last one, parts that failed to decode. Printed next to the
+   board's own count in "Stream opened ... page: n,ms,bad". */
 "function restartStream(force,why){\n"
 "  var now=Date.now();\n"
 "  if(!force&&now-lastRestart<RESTART_COOLDOWN){return}\n"
 "  lastRestart=now;\n"
-/* A new <img> every time, not a new src on the old one.
-
-   On 2026-10-22 (OV2640 800x600 over HTTPS) the picture went black with the
-   board still sending, and every reopen after that failed the same way: the
-   page asked for /stream again, the board answered, and the element never
-   read it - the board's 2 s send timeout then closed it ("Stream closed").
-   A page reload fixed it every time. So once an element stops drawing,
-   pointing it somewhere else is not enough; replacing it is what the reload
-   was doing. */
-"  var old=$('view'),img=document.createElement('img');\n"
-/* Tell the board what this element saw before it was replaced: how many
-   frames it drew and how long since the last one. Printed next to the
-   board's own count for the stream that just ended. */
-"  var p=imgOnEl+','+(now-lastImgAt);imgOnEl=0;\n"
-"  img.id='view';img.alt=old.alt;img.className=old.className;\n"
-"  img.onload=onImgLoad;img.onerror=onImgErr;\n"
-"  old.onload=null;old.onerror=null;old.removeAttribute('src');\n"
-"  old.parentNode.replaceChild(img,old);\n"
-"  img.src='/stream?'+(++seq)+'&r='+(why||'user')+'&p='+p;\n"
+"  var p=sDrawn+','+(now-lastFrameAt)+','+sBad;sDrawn=0;sBad=0;\n"
+"  if(sCtl){try{sCtl.abort()}catch(e){}}\n"
+"  var ctl=new AbortController();sCtl=ctl;pendingJpg=null;pendingCtl=null;\n"
+"  readStream('/stream?'+(++seq)+'&r='+(why||'user')+'&p='+p,ctl);\n"
 "}\n"
-
+"function hdrEnd(b){\n"
+"  for(var i=0;i+3<b.length;i++){\n"
+"    if(b[i]===13&&b[i+1]===10&&b[i+2]===13&&b[i+3]===10){return i}\n"
+"  }\n"
+"  return -1;\n"
+"}\n"
+/* Parts are "--boundary CRLF headers CRLF CRLF <Content-Length bytes> CRLF".
+   The CRLF after a JPEG becomes the start of the next part's header block,
+   which is harmless: only the first CRLFCRLF is looked for. */
+"function readStream(url,ctl){\n"
+"  fetch(url,{signal:ctl.signal,cache:'no-store'}).then(function(r){\n"
+"    if(!r.ok||!r.body){throw new Error('HTTP '+r.status)}\n"
+"    var rd=r.body.getReader(),buf=new Uint8Array(0),need=-1,dec=new TextDecoder();\n"
+"    function pump(){return rd.read().then(function(x){\n"
+"      if(x.done){throw new Error('stream ended')}\n"
+"      var nb=new Uint8Array(buf.length+x.value.length);\n"
+"      nb.set(buf);nb.set(x.value,buf.length);buf=nb;\n"
+"      for(;;){\n"
+"        if(need<0){\n"
+"          var h=hdrEnd(buf);\n"
+"          if(h<0){if(buf.length>4096){throw new Error('no part header')}break}\n"
+"          var m=/Content-Length:\\s*(\\d+)/i.exec(dec.decode(buf.subarray(0,h)));\n"
+"          if(!m){throw new Error('part without length')}\n"
+"          need=parseInt(m[1],10);\n"
+"          if(need>4194304){throw new Error('part too large')}\n"
+"          buf=buf.subarray(h+4);\n"
+"        }\n"
+"        if(buf.length<need){break}\n"
+"        showFrame(buf.slice(0,need),ctl);\n"
+"        buf=buf.subarray(need);need=-1;\n"
+"      }\n"
+"      return pump();\n"
+"    })}\n"
+"    return pump();\n"
+"  }).catch(function(e){\n"
+"    if(ctl!==sCtl||ctl.signal.aborted){return}\n"
+/* An error is not a person: the immediate retry is rate limited (the lwIP
+   image once reopened three times in a millisecond and left a pcb in
+   TIME_WAIT each time). Inside the cooldown the watchdog below retries. */
+"    var n=Date.now();\n"
+"    if(n-lastErr<ERR_COOLDOWN){return}\n"
+"    lastErr=n;restartStream(true,'err');\n"
+"  });\n"
+"}\n"
+"function showFrame(jpg,ctl){\n"
+"  if(decoding){pendingJpg=jpg;pendingCtl=ctl;return}\n"
+"  decoding=true;\n"
+"  createImageBitmap(new Blob([jpg],{type:'image/jpeg'})).then(function(bm){\n"
+"    if(ctl===sCtl){\n"
+"      var c=$('view');\n"
+"      if(c.width!==bm.width||c.height!==bm.height){c.width=bm.width;c.height=bm.height}\n"
+"      c.getContext('2d').drawImage(bm,0,0);\n"
+"      sDrawn++;lastFrameAt=Date.now();\n"
+"    }\n"
+"    if(bm.close){bm.close()}\n"
+"  },function(){if(ctl===sCtl){sBad++}}).then(function(){\n"
+"    decoding=false;\n"
+"    if(pendingJpg){\n"
+"      var j=pendingJpg,k=pendingCtl;pendingJpg=null;pendingCtl=null;\n"
+"      if(k===sCtl){showFrame(j,k)}\n"
+"    }\n"
+"  });\n"
+"}\n"
 /* ---- Noticing that the picture stopped ----
 
-   A single corrupt part kills an MJPEG stream. Chrome stops updating the <img>
-   at that frame and never resumes, while the TCP connection stays open and the
-   board goes on sending: the status line reads STREAMING at full frame rate and
-   the screen is black. Measured at 800x600, the sensor produces a frame that
-   fails validation 0.5% of the time at the stock clock and 1.1% at twice that,
-   and some fraction of what passes validation is corrupt further in, where
-   nothing checks it. Over an afternoon it is not a question of whether.
-
-   Nothing already on the page can see this. /api/status keeps answering, so the
-   offline path never fires - that one watches the device, and the device is
-   fine. What stopped is the picture.
-
-   Chrome fires `load` on the <img> for every part of a multipart stream, so a
-   timestamp from it is a direct measure of when a frame last arrived. That is
-   browser behaviour rather than a guarantee, so the count is checked first: it
-   takes three loads before the short timeout is trusted, and a browser that
-   only ever fires one gets a slow fallback instead of a restart every five
-   seconds forever.
-
-   Restarts go through the normal cooldown, so a stream that will not come back
-   is retried every twelve seconds rather than continuously. */
-/* The error path has its own, shorter cooldown, and it is not optional.
-
-   It was restartStream(true), and true is the flag that skips the cooldown
-   because a person clicked something. An error is not a person. On the lwIP
-   image, where a stream can fail the moment it opens, the handler reopened it,
-   the new one failed, and the handler reopened it again - three requests one
-   millisecond apart in the log, each a fresh TCP connection, each leaving a pcb
-   in TIME_WAIT. The recovery was doing more damage than the fault.
-
-   Three seconds is short enough that one corrupt frame is not a visible outage
-   and long enough that a stream which cannot open is retried at a rate the
-   device can absorb. */
-"var imgLoads=0,imgOnEl=0,lastImgAt=Date.now(),lastErr=0,ERR_COOLDOWN=3000;\n"
-"function onImgLoad(){imgLoads++;imgOnEl++;lastImgAt=Date.now()}\n"
-"function onImgErr(){\n"
-"  var n=Date.now();\n"
-/* Our own doing, not a fault.
-
-   Assigning img.src aborts whatever load was already running on that element,
-   and the abort arrives as an `error` event. So every restart produced an
-   error, the handler treated it as a broken stream and restarted again: two
-   opens a millisecond apart on every page load, which the board faithfully
-   reported as
-
-       [req s0] /stream?1791360846568
-       Stream opened on socket 0
-       [req s1] /stream?1791360846569
-       Stream taken over: socket 0 -> 1
-
-   Two sockets and two header sends for one picture, every time. Anything
-   within a second and a half of a restart we asked for is that abort. */
-"  if(n-lastRestart<1500){return}\n"
-"  if(n-lastErr<ERR_COOLDOWN){return}\n"
-"  lastErr=n;restartStream(true,'err');\n"
-"}\n"
-"$('view').onload=onImgLoad;$('view').onerror=onImgErr;\n"
-/* A hidden tab is not a stalled stream.
-
-   Chrome stops decoding images - and firing `load` - in a background tab,
-   while this timer keeps running. Measuring with the page in one tab and
-   /api/status in another therefore looked like a picture that froze every few
-   seconds: on 2026-10-22 one VGA run logged 214 reopens, every one r=idle,
-   none r=err, while the device sent frames throughout. So the idle check is
-   skipped while hidden, and the clock restarts when the tab is shown again. */
+   A frame drawn is now a fact, not a guess, so the check is short: nothing
+   drawn for 4 s while the device says it is streaming means reconnect. Not
+   while the device is stopped (/api/stop) - no frames is the right answer
+   then - and not while the tab is hidden: browsers throttle background tabs,
+   and the clock restarts when the tab is shown again (2026-10-22: a hidden
+   stream tab looked like a freeze every few seconds). */
 "document.addEventListener('visibilitychange',function(){\n"
-"  if(!document.hidden){lastImgAt=Date.now()}\n"
+"  if(!document.hidden){lastFrameAt=Date.now()}\n"
 "});\n"
 "setInterval(function(){\n"
-"  if(document.hidden){lastImgAt=Date.now();return}\n"
-"  var idle=Date.now()-lastImgAt;\n"
-/* Trust the short timeout only if THIS element has fired load per frame.
-   The count used to be page-wide, and on 2026-10-23 (Chrome, HTTPS) every new
-   element fired load once - the first frame - and never again while the board
-   went on sending 17 fps. Three restarts later the page-wide count passed 2,
-   the 5 s check fired against an element that would never report a second
-   frame, and the stream was torn down every 12 s all night (board log:
-   "200 frames in 12 s, last sent 30 ms ago", page: "1,11900"). */
-/* 2026-10-23: switching this to the per-element count stopped the 12 s
-   reconnects, but a real freeze then waited for the 120 s fallback and the
-   user found the 12 s cycle more stable in practice. Reverted to the
-   page-wide count until the page reads the stream itself (fetch). */
-"  if(imgLoads>2){if(idle>5000){restartStream(false,'idle')}}\n"
-"  else if(idle>120000){restartStream(false,'idle')}\n"
-"},2000);\n"
+"  if(document.hidden||!sCtl||last.streaming===false){lastFrameAt=Date.now();return}\n"
+"  if(Date.now()-lastFrameAt>4000){restartStream(false,'idle')}\n"
+"},1000);\n"
 /* Every one of these ends in .catch(offline) for the same reason the poll does:
    a control that cannot reach the device is itself evidence the link is down,
    and an uncaught rejection would leave the page looking healthy while the
