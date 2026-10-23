@@ -23,6 +23,7 @@ extern uint32_t g_push_calls;           /* server_toe.c */
 #if defined(STREAM_HTTPS)
 #include "tls_server.h"
 #endif
+#include "net_server.h"
 
 /* ------------------------------ SRAM reporting ----------------------------- */
 /*
@@ -403,7 +404,7 @@ int cam_state_status_json(char *buf, size_t cap)
 {
     int    n;
     size_t used;
-    char   tls_frag[360] = "";
+    char   tls_frag[560] = "";
 #if defined(STREAM_HTTPS)
     tls_status_json(tls_frag, sizeof(tls_frag));
 #endif
@@ -421,6 +422,10 @@ int cam_state_status_json(char *buf, size_t cap)
                  (unsigned long)g_push_calls);
     }
 #endif
+    {
+        size_t k = strlen(tls_frag);
+        net_server_status_json(tls_frag + k, sizeof(tls_frag) - k);
+    }
     long   age_ms = g_last_frame_us
                   ? (long)((time_us_64() - g_last_frame_us) / 1000ULL) : -1L;
     bool   stale  = (age_ms < 0) || ((unsigned long)age_ms > CAM_STATUS_STALE_MS);

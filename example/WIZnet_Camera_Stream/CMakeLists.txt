@@ -76,6 +76,8 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/cam_state.c
             ${CMAKE_CURRENT_LIST_DIR}/net_load.c
             ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
+            ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
+            ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
             ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
             ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
             ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
@@ -83,6 +85,7 @@ else()
 
     target_include_directories(camera_stream PRIVATE
             ${CMAKE_CURRENT_LIST_DIR}
+            ${CMAKE_CURRENT_LIST_DIR}/http
             ${CMAKE_CURRENT_LIST_DIR}/cam
             ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
             ${CMAKE_CURRENT_LIST_DIR}/capture)
@@ -157,6 +160,8 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/cam_state.c
                 ${CMAKE_CURRENT_LIST_DIR}/net_load.c
                 ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
+                ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
+                ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
                 ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
                 ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
                 ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
@@ -166,6 +171,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${TLS_BENCH_MBEDTLS_SRC})
         target_include_directories(camera_stream_https PRIVATE
                 ${CMAKE_CURRENT_LIST_DIR}
+                ${CMAKE_CURRENT_LIST_DIR}/http
                 ${CMAKE_CURRENT_LIST_DIR}/cam
                 ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
                 ${CMAKE_CURRENT_LIST_DIR}/capture

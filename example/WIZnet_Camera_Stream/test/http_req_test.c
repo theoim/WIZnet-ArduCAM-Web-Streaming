@@ -347,6 +347,18 @@ static __attribute__((noinline)) void test_headers(void)
     bad("empty name",        "GET /x HTTP/1.1\r\n: c\r\nHost: c\r\n\r\n", HTTP_ERR_BAD_HEADER);
     bad("obs-fold",          "GET /x HTTP/1.1\r\nHost: c\r\n continued\r\n\r\n", HTTP_ERR_BAD_HEADER);
     bad("bare LF",           "GET /x HTTP/1.1\nHost: c\r\n\r\n", HTTP_ERR_BAD_HEADER);
+    bad("LF-only request",   "GET / HTTP/1.1\nHost: x\n\n", HTTP_ERR_BAD_HEADER);   /* never CRLFCRLF: reject, do not wait */
+    bad("leading LF",        "\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", HTTP_ERR_BAD_HEADER);
+    {
+        /* rejected as soon as the LF arrives, without the rest of the request */
+        http_req_t r; size_t c = 0;
+        http_req_init(&r);
+        CHECK(http_req_feed(&r, (const uint8_t *)"GET / HTTP/1.1\n", 15, &c) == HTTP_REQ_ERROR &&
+              http_req_error(&r) == HTTP_ERR_BAD_HEADER && c == 15, "bare LF rejected on arrival (c=%zu)", c);
+        http_req_init(&r);
+        CHECK(http_req_feed(&r, (const uint8_t *)"GET / HTTP/1.1\r", 15, &c) == HTTP_REQ_NEED_MORE, "CR at chunk end waits");
+        CHECK(http_req_feed(&r, (const uint8_t *)"\nHost: x\r\n\r\n", 12, &c) == HTTP_REQ_COMPLETE, "CR|LF split across feeds is fine");
+    }
     bad("bare CR",           "GET /x HTTP/1.1\r\nHost: c\rX: y\r\n\r\n", HTTP_ERR_BAD_HEADER);
     bad("ctl in value",      "GET /x HTTP/1.1\r\nHost: c\x01\r\n\r\n", HTTP_ERR_BAD_HEADER);
     bad("DEL in value",      "GET /x HTTP/1.1\r\nHost: c\x7F\r\n\r\n", HTTP_ERR_BAD_HEADER);

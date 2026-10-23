@@ -23,7 +23,9 @@
 #define TLS_MAX_CONN   4
 #endif
 
-void    tls_server_init(void);
+/* false: TLS could not be set up (no RNG, bad cert or key). tls_accept()
+ * then refuses every connection instead of serving half a server. */
+bool    tls_server_init(void);
 
 bool    tls_active(uint8_t sn);              /* a context exists for this socket */
 bool    tls_ready(uint8_t sn);               /* handshake complete               */

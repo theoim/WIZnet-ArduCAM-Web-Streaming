@@ -86,6 +86,7 @@ static tls_slot_t g_slot[TLS_SOCKETS];
 static unsigned   g_active;
 static uint32_t   g_full, g_resumed, g_fail, g_refused;
 static uint32_t   g_last_hs_cpu_ms, g_last_hs_wall_ms;
+static bool       g_tls_ok;          /* tls_server_init() completed */
 
 static void report(const char *what, int rc)
 {
@@ -133,7 +134,7 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len)
 }
 
 /* ---------------------------------------------------------------- setup -- */
-void tls_server_init(void)
+bool tls_server_init(void)
 {
     int rc;
 
@@ -141,39 +142,41 @@ void tls_server_init(void)
     mbedtls_ctr_drbg_init(&g_drbg);
     rc = mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
                                (const unsigned char *)"camera_stream_https", 19);
-    if (rc) { report("drbg seed", rc); return; }
+    if (rc) { report("drbg seed", rc); return false; }
 
     mbedtls_x509_crt_init(&g_chain);
     rc = mbedtls_x509_crt_parse_der(&g_chain, https_dev_cert_der, https_dev_cert_der_len);
     if (!rc) rc = mbedtls_x509_crt_parse_der(&g_chain, https_ca_cert_der, https_ca_cert_der_len);
-    if (rc) { report("certificate parse", rc); return; }
+    if (rc) { report("certificate parse", rc); return false; }
 
     mbedtls_pk_init(&g_key);
     rc = mbedtls_pk_parse_key(&g_key, https_dev_key_der, https_dev_key_der_len, NULL, 0,
                               mbedtls_ctr_drbg_random, &g_drbg);
-    if (rc) { report("key parse", rc); return; }
+    if (rc) { report("key parse", rc); return false; }
 
     mbedtls_ssl_ticket_init(&g_ticket);
     rc = mbedtls_ssl_ticket_setup(&g_ticket, mbedtls_ctr_drbg_random, &g_drbg,
                                   MBEDTLS_CIPHER_AES_128_GCM, 86400);
-    if (rc) { report("ticket setup", rc); return; }
+    if (rc) { report("ticket setup", rc); return false; }
 
     mbedtls_ssl_config_init(&g_conf);
     rc = mbedtls_ssl_config_defaults(&g_conf, MBEDTLS_SSL_IS_SERVER,
                                      MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-    if (rc) { report("config defaults", rc); return; }
+    if (rc) { report("config defaults", rc); return false; }
     mbedtls_ssl_conf_rng(&g_conf, mbedtls_ctr_drbg_random, &g_drbg);
     mbedtls_ssl_conf_ciphersuites(&g_conf, g_suites);
     /* Our order, not the browser's: browsers on PCs with AES instructions list
      * AES-GCM first, which is 3x slower here. */
     mbedtls_ssl_conf_preference_order(&g_conf, MBEDTLS_SSL_SRV_CIPHERSUITE_ORDER_SERVER);
     rc = mbedtls_ssl_conf_own_cert(&g_conf, &g_chain, &g_key);
-    if (rc) { report("own cert", rc); return; }
+    if (rc) { report("own cert", rc); return false; }
     mbedtls_ssl_conf_session_tickets_cb(&g_conf, mbedtls_ssl_ticket_write,
                                         mbedtls_ssl_ticket_parse, &g_ticket);
 
+    g_tls_ok = true;
     printf("[tls] ready: ECDHE-ECDSA P-256, ChaCha20-Poly1305 then AES-128-GCM,"
            " tickets on, max %u connections\n", (unsigned)TLS_MAX_CONN);
+    return true;
 }
 
 /* ------------------------------------------------------------ lifecycle -- */
@@ -185,6 +188,10 @@ bool tls_accept(uint8_t sn)
     if (sn >= TLS_SOCKETS) return false;
     tls_slot_t *s = &g_slot[sn];
     if (s->active) return true;
+    if (!g_tls_ok) {                    /* init failed: refuse, do not half-serve */
+        g_refused++;
+        return false;
+    }
     if (g_active >= TLS_MAX_CONN) {
         g_refused++;
         printf("[tls] s%u refused: %u connections already (max %u)\n",

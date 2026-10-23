@@ -85,7 +85,7 @@ uint32_t    cam_state_sram_total(void);
  * document carries every control's current value so that one poll re-renders
  * the entire panel - the page never has to work out what changed.
  */
-#define CAM_STATUS_JSON_MAX  1024
+#define CAM_STATUS_JSON_MAX  1280
 
 /**
  * Build the status document.

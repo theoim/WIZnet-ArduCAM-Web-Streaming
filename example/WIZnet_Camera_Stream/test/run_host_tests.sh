@@ -27,14 +27,21 @@ gcc -std=c99 $WARN $DEFS -O1 -g -c \
     "$src/http/http_req.c" -o "$out/http_req.o"
 gcc -std=c99 $TWARN $DEFS -O1 -g \
     -I"$src/http" "$here/http_req_test.c" "$out/http_req.o" -o "$out/http_req_test"
+gcc -std=c99 $WARN $DEFS -O1 -g -c \
+    "$src/http/conn.c" -o "$out/conn.o"
+gcc -std=c99 $TWARN $DEFS -O1 -g \
+    -I"$src/http" "$here/conn_test.c" "$out/conn.o" -o "$out/conn_test"
 echo "== host run"
 "$out/http_req_test"
+"$out/conn_test"
 
 if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
     echo "== arm cross-compile (size only, not linked)"
     arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c \
         "$src/http/http_req.c" -o "$out/http_req.arm.o"
-    arm-none-eabi-size "$out/http_req.arm.o"
+    arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c \
+        "$src/http/conn.c" -o "$out/conn.arm.o"
+    arm-none-eabi-size "$out/http_req.arm.o" "$out/conn.arm.o"
 else
     echo "== arm-none-eabi-gcc not on PATH, cross-compile skipped"
 fi

@@ -446,6 +446,20 @@ http_req_result_t http_req_feed(http_req_t *r, const uint8_t *data, size_t len,
         memcpy(r->hdr + r->hdr_len, data, take);
         r->hdr_len = (uint16_t)(r->hdr_len + take);
 
+        /* A bare LF can never be part of a valid header block, and a client
+           that ends lines with LF alone never produces the CRLFCRLF this loop
+           waits for - it would sit on a connection until the request timeout
+           (measured on the board 2026-10-23: 408 after 5 s). Reject on sight. */
+        {
+            uint16_t from = r->hdr_len > take ? (uint16_t)(r->hdr_len - take) : 0;
+            for (uint16_t i = from; i < r->hdr_len; i++) {
+                if (r->hdr[i] == '\n' && (i == 0 || r->hdr[i - 1] != '\r')) {
+                    if (consumed) *consumed = (size_t)(i + 1u - from);
+                    return fail(r, HTTP_ERR_BAD_HEADER);
+                }
+            }
+        }
+
         uint16_t term = 0;
         bool found = false;
         for (uint16_t i = scan_from; i + 3 < r->hdr_len; i++) {

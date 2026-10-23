@@ -16,6 +16,8 @@
 #ifndef __NET_SERVER_H__
 #define __NET_SERVER_H__
 
+#include <stddef.h>
+
 /** Bring up the chip, the addressing and the listeners. Blocks until ready. */
 void net_server_init(void);
 
@@ -27,5 +29,8 @@ void net_server_init(void);
  * the timers. Anything that blocks in here stops the camera as well.
  */
 void net_server_service(void);
+
+/** Connection-lifetime counters for /api/status: a "\"http\":{...}," fragment. */
+int net_server_status_json(char *buf, size_t cap);
 
 #endif /* __NET_SERVER_H__ */
