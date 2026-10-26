@@ -27,6 +27,8 @@ static uint8_t g_buf[2][CAM_FRAME_BUF_SIZE] __attribute__((aligned(4)));
 static volatile buf_state_t g_state[2];
 static volatile uint32_t    g_len[2];
 static volatile uint32_t    g_seq_of[2];
+static volatile uint64_t    g_time_of[2];       /* capture completed, us since boot */
+static volatile uint8_t     g_readers[2];       /* snapshots sending from it        */
 
 static critical_section_t g_cs;
 static volatile uint32_t  g_seq;              /* last frame number completed */
@@ -37,6 +39,7 @@ static volatile uint32_t  g_take_hit, g_take_miss, g_leaks;
 static volatile bool g_started;
 static volatile bool g_pause_req;
 static volatile bool g_paused;
+static volatile bool g_oneshot_req;            /* one capture while not streaming */
 
 /* ---- control command slot (cam_pipeline.h) ---- */
 typedef enum { CMD_EMPTY = 0, CMD_POSTED, CMD_RUNNING, CMD_DONE } cmd_state_t;
@@ -49,18 +52,19 @@ static cam_ctrl_written_t   g_written;
 static volatile uint32_t    g_cmd_applied, g_cmd_timeouts;
 
 /* Pick a buffer for the next capture: a free one, else the READY one that
- * nobody took (latest frame wins). Never the one being sent. */
+ * nobody took (latest frame wins). Never the one being sent, by the stream or
+ * by a snapshot. */
 static int claim_for_capture(void)
 {
     int idx = -1;
     critical_section_enter_blocking(&g_cs);
     for (int i = 0; i < 2 && idx < 0; i++) {
-        if (g_state[i] == BUF_FREE) idx = i;
+        if (g_state[i] == BUF_FREE && g_readers[i] == 0) idx = i;
     }
     if (idx < 0) {
         int oldest = -1;
         for (int i = 0; i < 2; i++) {
-            if (g_state[i] == BUF_READY &&
+            if (g_state[i] == BUF_READY && g_readers[i] == 0 &&
                 (oldest < 0 || g_seq_of[i] < g_seq_of[oldest])) {
                 oldest = i;
             }
@@ -120,9 +124,13 @@ static void core1_capture_loop(void)
             continue;
         }
         core1_service_command();
+        bool oneshot = false;
         if (!cam_state_streaming()) {
-            sleep_ms(2);
-            continue;
+            if (!g_oneshot_req) {
+                sleep_ms(2);
+                continue;
+            }
+            oneshot = true;            /* a snapshot asked; streaming stays off */
         }
 
         int idx = claim_for_capture();
@@ -137,10 +145,12 @@ static void core1_capture_loop(void)
 
         critical_section_enter_blocking(&g_cs);
         if (ok) {
-            g_len[idx]    = len;
-            g_seq_of[idx] = ++g_seq;
-            g_state[idx]  = BUF_READY;
+            g_len[idx]     = len;
+            g_seq_of[idx]  = ++g_seq;
+            g_time_of[idx] = time_us_64();
+            g_state[idx]   = BUF_READY;
             g_captured++;
+            if (oneshot) g_oneshot_req = false;   /* a failure retries until withdrawn */
         } else {
             g_state[idx] = BUF_FREE;
         }
@@ -232,6 +242,72 @@ void cam_pipeline_release(const cam_frame_t *f)
 {
     critical_section_enter_blocking(&g_cs);
     if (g_state[f->idx] == BUF_SENDING) g_state[f->idx] = BUF_FREE;
+    critical_section_exit(&g_cs);
+}
+
+/* ------------------------------- Snapshot --------------------------------- */
+/* Newest READY buffer captured after `after_us` with a sequence above
+ * `min_seq`, or -1. Caller holds g_cs. */
+static int newest_ready(uint32_t min_seq, uint64_t after_us)
+{
+    int best = -1;
+    for (int i = 0; i < 2; i++) {
+        if (g_state[i] == BUF_READY && g_seq_of[i] > min_seq &&
+            g_time_of[i] >= after_us &&
+            (best < 0 || g_seq_of[i] > g_seq_of[best])) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+bool cam_pipeline_snapshot_hold(cam_frame_t *f, uint32_t timeout_ms, bool *fresh)
+{
+    if (!g_started || get_core_num() == 1) {
+        return false;
+    }
+    uint64_t now = time_us_64();
+    uint64_t recent = now > CAM_SNAPSHOT_MAX_AGE_MS * 1000ull
+                    ? now - CAM_SNAPSHOT_MAX_AGE_MS * 1000ull : 0;
+    uint32_t seq0;
+    int      idx;
+
+    critical_section_enter_blocking(&g_cs);
+    seq0 = g_seq;
+    /* Streaming: the newest frame will do if it is recent. Stopped: a READY
+     * buffer is whatever was left when the stream stopped, so always capture. */
+    idx = cam_state_streaming() ? newest_ready(0, recent) : -1;
+    if (idx < 0 && !cam_state_streaming()) {
+        g_oneshot_req = true;
+    }
+    if (idx >= 0) g_readers[idx]++;
+    critical_section_exit(&g_cs);
+
+    absolute_time_t until = make_timeout_time_ms(timeout_ms);
+    while (idx < 0) {
+        if (absolute_time_diff_us(get_absolute_time(), until) <= 0) {
+            g_oneshot_req = false;       /* withdrawn; a capture in flight lands as READY */
+            return false;
+        }
+        tight_loop_contents();
+        critical_section_enter_blocking(&g_cs);
+        idx = newest_ready(seq0, now);
+        if (idx >= 0) g_readers[idx]++;
+        critical_section_exit(&g_cs);
+    }
+
+    f->data = g_buf[idx];
+    f->len  = g_len[idx];
+    f->seq  = g_seq_of[idx];
+    f->idx  = idx;
+    if (fresh) *fresh = (f->seq > seq0);
+    return true;
+}
+
+void cam_pipeline_snapshot_release(const cam_frame_t *f)
+{
+    critical_section_enter_blocking(&g_cs);
+    if (g_readers[f->idx]) g_readers[f->idx]--;
     critical_section_exit(&g_cs);
 }
 

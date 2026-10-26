@@ -60,6 +60,30 @@ uint32_t cam_pipeline_leaks(void);        /* SENDING buffers reclaimed       */
 /* One line describing both buffers and the counters, for the stall log. */
 void cam_pipeline_debug(char *out, unsigned cap);
 
+/* ------------------------------- Snapshot ---------------------------------
+ *
+ * GET /snapshot.jpg sends one frame straight out of a capture buffer - no copy.
+ * The buffer is held with a reader count, so core 1 captures into the other
+ * one until the snapshot is sent. The streaming flag is not touched.
+ *
+ *   streaming  the newest frame if it is under CAM_SNAPSHOT_MAX_AGE_MS old,
+ *              else wait for the next one
+ *   stopped    core 1 captures one frame for it; the stream stays stopped
+ *
+ * Core 0 waits at most timeout_ms, then gives up (the server answers 504).
+ * false also before cam_pipeline_start() and on core 1.
+ */
+#ifndef CAM_SNAPSHOT_TIMEOUT_MS
+#define CAM_SNAPSHOT_TIMEOUT_MS  2500u
+#endif
+#ifndef CAM_SNAPSHOT_MAX_AGE_MS
+#define CAM_SNAPSHOT_MAX_AGE_MS  500u
+#endif
+
+/* *fresh (optional): true when the frame was captured after the call. */
+bool cam_pipeline_snapshot_hold(cam_frame_t *f, uint32_t timeout_ms, bool *fresh);
+void cam_pipeline_snapshot_release(const cam_frame_t *f);
+
 /* ---------------------------- Control commands ----------------------------
  *
  * Sensor controls go through one fixed slot rather than through

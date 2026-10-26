@@ -229,6 +229,43 @@ def t_controls(b):
           f"{before} -> {s.get('ctrl_applied')}")
 
 
+def snap(b):
+    t0 = time.monotonic()
+    st, hdr, body = parse(b.get("/snapshot.jpg"))
+    return st, hdr, body, (time.monotonic() - t0) * 1000
+
+
+def jpeg_ok(st, hdr, body):
+    return (st == 200 and hdr.get("content-type") == "image/jpeg"
+            and hdr.get("content-length") == str(len(body))
+            and body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9")
+
+
+def t_snapshot(b):
+    """Phase 2d. Stopped-stream case stops the stream for a moment and puts it
+    back the way it was."""
+    print("snapshot (2d)")
+    was = bool((b.status() or {}).get("streaming"))
+    if was:
+        for i in range(3):
+            st, hdr, body, ms = snap(b)
+            check(f"streaming: snapshot {i + 1} -> 200 JPEG ({len(body)} B, {ms:.0f} ms)",
+                  jpeg_ok(st, hdr, body) and ms < 2500, f"got {st} {hdr.get('content-type')}")
+        check("streaming flag untouched", (b.status() or {}).get("streaming") is True)
+    parse(b.get("/api/stop"))
+    try:
+        for i in range(2):
+            st, hdr, body, ms = snap(b)
+            check(f"stopped: snapshot {i + 1} -> 200 JPEG ({len(body)} B, {ms:.0f} ms)",
+                  jpeg_ok(st, hdr, body) and ms < 2500, f"got {st} {hdr.get('content-type')}")
+        check("stopped: stream stays stopped", (b.status() or {}).get("streaming") is False)
+    finally:
+        if was:
+            parse(b.get("/api/start"))
+    st, _, _ = parse(b.roundtrip(b"POST /snapshot.jpg HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"))
+    check("POST /snapshot.jpg -> 405", st == 405, f"got {st}")
+
+
 def t_split(b):
     print("split")
     req = b"GET /api/status HTTP/1.1\r\nHost: 192.168.11.7\r\nUser-Agent: split-test\r\n\r\n"
@@ -403,6 +440,7 @@ def main():
           f"http {before.get('http')}")
     t_routes(b)
     t_controls(b)
+    t_snapshot(b)
     t_split(b)
     t_limits(b)
     t_policy(b)

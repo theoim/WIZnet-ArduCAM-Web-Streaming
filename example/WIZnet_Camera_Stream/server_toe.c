@@ -604,6 +604,52 @@ static int32_t h_reset(uint8_t sn, const http_req_t *r)
     return send_status(sn, false);
 }
 
+/* ------------------------------ Snapshot (2d) ------------------------------ */
+/*
+ * GET /snapshot.jpg - one JPEG. Streaming or not, the streaming flag and the
+ * stream's frame rate are left alone: while the stream runs, the frame comes
+ * out of the capture buffer it is already in; while it is stopped, core 1
+ * captures one frame for this request. No frame within 2.5 s is 504.
+ *
+ * Core 0 waits here, like a control write does, so the other sockets are not
+ * served until the frame is out.
+ */
+static int32_t h_snapshot(uint8_t sn, const http_req_t *r)
+{
+    (void)r;
+    uint32_t t0 = now_ms();
+#if STREAM_PIPELINE
+    cam_frame_t fr;
+    bool fresh = false;
+    if (!cam_pipeline_snapshot_hold(&fr, CAM_SNAPSHOT_TIMEOUT_MS, &fresh)) {
+        printf("[snap] no frame within %u ms (%s)\n", (unsigned)CAM_SNAPSHOT_TIMEOUT_MS,
+               cam_state_streaming() ? "streaming" : "stopped");
+        return send_error(sn, 504, NULL);
+    }
+    uint32_t waited = now_ms() - t0;
+    int32_t rc = send_response(sn, "200 OK", "image/jpeg",
+                               (const char *)fr.data, fr.len);
+    cam_pipeline_snapshot_release(&fr);
+    printf("[snap] %lu B seq %lu (%s) waited %lu ms, sent in %lu ms\n",
+           (unsigned long)fr.len, (unsigned long)fr.seq,
+           fresh ? "captured for it" : "latest", (unsigned long)waited,
+           (unsigned long)(now_ms() - t0 - waited));
+    return rc;
+#else
+    /* Sequential build: capture on this core, into the one buffer. */
+    int cap = cam_capture_frame();
+    uint32_t len = camera.frame_length;
+    if (cap != 0 || now_ms() - t0 > CAM_SNAPSHOT_TIMEOUT_MS) {
+        printf("[snap] no frame (rc %d, %lu ms)\n", cap, (unsigned long)(now_ms() - t0));
+        return send_error(sn, 504, NULL);
+    }
+    if (len < 2 || image_buff[0] != 0xFF || image_buff[1] != 0xD8) {
+        return send_error(sn, 504, NULL);
+    }
+    return send_response(sn, "200 OK", "image/jpeg", (const char *)image_buff, len);
+#endif
+}
+
 /* --------------------------- Camera controls (2c) --------------------------- */
 /*
  * GET /api/controls - what the driver offers, for the page to build its panel.
@@ -900,6 +946,7 @@ static const route_t g_routes[] = {
     { "/index.html",   M_GET, ROUTE_PUBLIC, h_index    },
     { "/logo.png",     M_GET, ROUTE_PUBLIC, h_logo     },
     { "/stream",       M_GET, ROUTE_VIEW,   h_stream   },
+    { "/snapshot.jpg", M_GET, ROUTE_VIEW,   h_snapshot },
     { "/api/status",   M_GET, ROUTE_VIEW,   h_status   },
     { "/api/controls", M_GET, ROUTE_VIEW,   h_controls },
     { "/api/start",    M_GET, ROUTE_ADMIN,  h_start    },

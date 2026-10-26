@@ -434,6 +434,7 @@ static __attribute__((noinline)) void test_reuse_and_state(void)
         CHECK(http_req_status(&r) == map[i].s, "status for %s", http_req_err_name(map[i].e));
         CHECK(strcmp(http_req_status_text(map[i].s), "Error") != 0, "text for %d", map[i].s);
     }
+    CHECK(strcmp(http_req_status_text(504), "Gateway Timeout") == 0, "text for 504 (snapshot)");
 }
 
 /* Random bytes, and mutations of a valid request: must terminate with one of
