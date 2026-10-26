@@ -45,10 +45,19 @@ if(NOT CAM_BUILD_GIT)
 endif()
 string(TIMESTAMP CAM_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 
+# Phase 2b diagnostic, LH module only: after every frame-size write, read the
+# control registers 0x0122-0x012C and 0x0130-0x0134 twice and log them. Read
+# only - nothing is written. Off in normal images.
+option(CAM_QB_DIAG "Log the Arducam controller's control registers (read only)" OFF)
+
 set(CAM_COMMON_DEFS
         CAM_MODULE_HEADER="modules/${CAMERA_MODULE}.h"
         CAM_BUILD_GIT="${CAM_BUILD_GIT}"
         CAM_BUILD_UTC="${CAM_BUILD_UTC}")
+if(CAM_QB_DIAG)
+    list(APPEND CAM_COMMON_DEFS CAM_QB_DIAG=1)
+    message(STATUS "camera_stream: CAM_QB_DIAG on - control registers logged (read only)")
+endif()
 
 # --------------------------------------------------------------- probe -------
 add_executable(camera_probe
@@ -81,6 +90,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
             ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
             ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
+            ${CMAKE_CURRENT_LIST_DIR}/cam/cam_ctrl.c
             ${CAM_SENSOR_SRC})
 
     target_include_directories(camera_stream PRIVATE
@@ -165,6 +175,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
                 ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
                 ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
+                ${CMAKE_CURRENT_LIST_DIR}/cam/cam_ctrl.c
                 ${CAM_SENSOR_SRC}
                 ${CMAKE_CURRENT_LIST_DIR}/tls/tls_server.c
                 ${CMAKE_CURRENT_LIST_DIR}/tls/https_cert.c

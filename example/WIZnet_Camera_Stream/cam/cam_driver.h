@@ -19,6 +19,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cam_ctrl.h"
+
 typedef enum {
     PIXFORMAT_JPEG   = 1,
     PIXFORMAT_RGB565 = 2,
@@ -68,5 +70,15 @@ int  cam_set_clock_div(uint8_t clk_div, uint8_t pll_div);
 
 /* Reset the sensor and restore format, size and clock without a power cycle. */
 int  cam_recover(void);
+
+/* Image controls (brightness, flip, ...) this driver offers - see cam_ctrl.h.
+ * *count 0 means none: the page shows no control panel and every request to
+ * set one is refused as unknown. */
+const cam_ctrl_desc_t *cam_sensor_controls(unsigned *count);
+
+/* Write control @p idx of that table. The value is already range-checked by
+ * cam_ctrl. 0 = the write was acknowledged (not read back). Called only on the
+ * core that owns the sensor - go through cam_pipeline_set_controls(). */
+int  cam_sensor_set_control(unsigned idx, int16_t value);
 
 #endif /* CAM_DRIVER_H */

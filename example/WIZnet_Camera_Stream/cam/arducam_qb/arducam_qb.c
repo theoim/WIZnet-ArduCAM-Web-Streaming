@@ -146,6 +146,113 @@ static uint8_t clk_div_for_res(res_t res)
     }
 }
 
+#if CAM_QB_DIAG
+/*
+ * Phase 2b diagnostic - READ ONLY. Nothing here writes to the module.
+ *
+ * mega_ccm_regs.h names these registers, but nothing in this repository says
+ * what values they take or whether this module (SENSOR_ID 0x039E) implements
+ * them. FOCUS 0x0129 already reads 0xFF on this fixed-focus module, which
+ * suggests 0xFF is how the controller answers for a register it does not
+ * have. That is a hint, not a rule: a register can read 0xFF and still be
+ * writable, or read a real value and do nothing. So this only logs; deciding
+ * which ones become controls waits for a write test with the picture in view.
+ *
+ * Each register is read twice; a difference between the reads is reported.
+ */
+static const struct {
+    uint16_t    reg;
+    const char *name;                /* mega_ccm_regs.h name, or why not */
+} k_diag_regs[] = {
+    { 0x0122, "BRIGHTNESS" },
+    { 0x0123, "CONTRAST" },
+    { 0x0124, "SATURATION" },
+    { 0x0125, "EXP_COMPENSATE" },
+    { 0x0126, "AWB_MODE" },
+    { 0x0127, "SPECIAL" },
+    { 0x0128, "SHARPNESS" },
+    { 0x0129, "FOCUS" },
+    { 0x012A, "IMAGE_QUALITY" },
+    { 0x012B, "IMAGE_FLIP" },
+    { 0x012C, "IMAGE_MIRROR" },
+    { 0x0130, "AGC_MODE" },
+    { 0x0131, "MANUAL_AGC" },
+    { 0x0132, "(no name in mega_ccm_regs.h)" },
+    { 0x0133, "MANUAL_EXP_H" },
+    { 0x0134, "MANUAL_EXP_L" },
+};
+
+static void qb_diag_read(const char *when)
+{
+    unsigned ff = 0, other = 0, bad = 0;
+
+    printf("[qb-diag] %s - read only; names are mega_ccm_regs.h's, not proof of function\n",
+           when);
+    for (unsigned i = 0; i < sizeof(k_diag_regs) / sizeof(k_diag_regs[0]); i++) {
+        uint8_t a = 0, b = 0;
+        int ea = sccb_read16(QB_SCCB_ADDR, k_diag_regs[i].reg, &a);
+        int eb = sccb_read16(QB_SCCB_ADDR, k_diag_regs[i].reg, &b);
+        const char *note;
+        if (ea || eb) {
+            note = "read failed";
+            bad++;
+        } else if (a != b) {
+            note = "two reads differ";
+            bad++;
+        } else if (a == 0xFF) {
+            note = "0xFF - reads like FOCUS (not implemented?)";
+            ff++;
+        } else {
+            note = "value - candidate, unconfirmed";
+            other++;
+        }
+        if (ea || eb) {
+            printf("[qb-diag]   0x%04X %-28s  --          %s\n",
+                   k_diag_regs[i].reg, k_diag_regs[i].name, note);
+        } else {
+            printf("[qb-diag]   0x%04X %-28s  0x%02X 0x%02X   %s\n",
+                   k_diag_regs[i].reg, k_diag_regs[i].name, a, b, note);
+        }
+    }
+    printf("[qb-diag] %u read a value, %u read 0xFF, %u failed/unstable\n", other, ff, bad);
+}
+
+/*
+ * Phase 2b write test, diagnostic image only (GET /api/diag/reg). Limited to
+ * the control block 0x0122-0x0134 so that reset (0x0102), format, resolution
+ * and the clock dividers (0x0200) cannot be hit by a typo. Caller owns the
+ * sensor (server pauses core 1 first).
+ *
+ * Returns 0 ok, -1 address outside the block, -2 SCCB error.
+ */
+int cam_qb_diag_reg(uint16_t reg, bool do_write, uint8_t val,
+                    uint8_t *before, uint8_t *after)
+{
+    if (reg < 0x0122 || reg > 0x0134) {
+        return -1;
+    }
+    if (sccb_read16(QB_SCCB_ADDR, reg, before)) {
+        return -2;
+    }
+    if (do_write) {
+        if (wr(reg, val)) {
+            return -2;
+        }
+        sleep_ms(50);
+    }
+    if (sccb_read16(QB_SCCB_ADDR, reg, after)) {
+        return -2;
+    }
+    if (do_write) {
+        printf("[qb-diag] write 0x%04X: before 0x%02X, wrote 0x%02X, read back 0x%02X\n",
+               reg, *before, val, *after);
+    } else {
+        printf("[qb-diag] read 0x%04X: 0x%02X\n", reg, *after);
+    }
+    return 0;
+}
+#endif /* CAM_QB_DIAG */
+
 int cam_set_framesize(res_t res)
 {
     uint8_t  code;
@@ -181,6 +288,16 @@ int cam_set_framesize(res_t res)
 
     /* JPEG: the DMA chunk size, not a row. */
     camera.line_length = 512;
+#if CAM_QB_DIAG
+    {
+        static const char *const nm[] = { "?", "?", "?", "320x240", "?", "640x480", "?",
+                                          "?", "1280x720", "?", "1600x1200", "1920x1080" };
+        char when[48];
+        snprintf(when, sizeof(when), "after frame size %s (rc %d)",
+                 (unsigned)res < sizeof(nm) / sizeof(nm[0]) ? nm[res] : "?", ret);
+        qb_diag_read(when);
+    }
+#endif
     return ret;
 }
 
@@ -194,6 +311,25 @@ int cam_set_pixformat(pixfmt_t fmt)
     }
     camera.pixfmt = PIXFORMAT_JPEG;
     return wr(QB_REG_PIXEL_FMT, 0x01);
+}
+
+/*
+ * Image controls. mega_ccm_regs.h names brightness, contrast, flip and others
+ * at 0x0122-0x0134, but their value ranges and whether this module implements
+ * them are not known yet (see qb_diag_read). Until a write test confirms
+ * them, none are offered.
+ */
+const cam_ctrl_desc_t *cam_sensor_controls(unsigned *count)
+{
+    *count = 0;
+    return NULL;
+}
+
+int cam_sensor_set_control(unsigned idx, int16_t value)
+{
+    (void)idx;
+    (void)value;
+    return -1;                       /* no table: nothing can name a control */
 }
 
 int cam_recover(void)

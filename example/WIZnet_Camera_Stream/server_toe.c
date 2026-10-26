@@ -658,6 +658,91 @@ static int32_t h_clk(uint8_t sn, const http_req_t *r)
     return send_status(sn, false);
 }
 
+#if CAM_QB_DIAG
+/*
+ * GET /api/diag/reg?a=<addr>[&v=<value>]   diagnostic image only
+ *
+ *   a   register, hex: 0x012A or 012A (0x0122-0x0134 only)
+ *   v   value to write, hex 0x32 or decimal 50; leave out to just read
+ *
+ * Answers what was there before, what was written and what reads back. The
+ * picture and frame size are for the person running the test to judge.
+ */
+int cam_qb_diag_reg(uint16_t reg, bool do_write, uint8_t val,
+                    uint8_t *before, uint8_t *after);
+
+static bool parse_num(const char *s, size_t n, bool hex_default, uint32_t max, uint32_t *out)
+{
+    bool hex = hex_default;
+    if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        hex = true;
+        s += 2;
+        n -= 2;
+    }
+    if (n == 0 || n > 5) return false;
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9')                d = (uint32_t)(c - '0');
+        else if (hex && c >= 'a' && c <= 'f')    d = (uint32_t)(c - 'a' + 10);
+        else if (hex && c >= 'A' && c <= 'F')    d = (uint32_t)(c - 'A' + 10);
+        else return false;
+        v = v * (hex ? 16u : 10u) + d;
+    }
+    if (v > max) return false;
+    *out = v;
+    return true;
+}
+
+static int32_t h_diag_reg(uint8_t sn, const http_req_t *r)
+{
+    char a[16], v[16], body[160];
+    size_t an = query_value(r, "a", a, sizeof(a));
+    size_t vn = query_value(r, "v", v, sizeof(v));
+    uint32_t reg, val = 0;
+
+    if (!parse_num(a, an, true, 0xFFFF, &reg) ||
+        (vn && !parse_num(v, vn, false, 0xFF, &val))) {
+        static const char msg[] = "use /api/diag/reg?a=0x012A to read, "
+                                  "/api/diag/reg?a=0x012A&v=0x32 to write\n";
+        return send_response(sn, "400 Bad Request", "text/plain", msg,
+                             (uint32_t)(sizeof(msg) - 1));
+    }
+
+    uint8_t before = 0, after = 0;
+#if STREAM_PIPELINE
+    cam_pipeline_pause();               /* core 1 off the sensor first */
+#endif
+    int rc = cam_qb_diag_reg((uint16_t)reg, vn != 0, (uint8_t)val, &before, &after);
+#if STREAM_PIPELINE
+    cam_pipeline_resume();
+#endif
+
+    int n;
+    if (rc == -1) {
+        n = snprintf(body, sizeof(body),
+                     "{\"error\":\"0x%04lX is outside 0x0122-0x0134\"}", (unsigned long)reg);
+        return send_response(sn, "400 Bad Request", "application/json", body, (uint32_t)n);
+    }
+    if (rc != 0) {
+        n = snprintf(body, sizeof(body),
+                     "{\"error\":\"SCCB failed on 0x%04lX\"}", (unsigned long)reg);
+        return send_response(sn, "502 Bad Gateway", "application/json", body, (uint32_t)n);
+    }
+    if (vn) {
+        n = snprintf(body, sizeof(body),
+                     "{\"reg\":\"0x%04lX\",\"before\":\"0x%02X\",\"wrote\":\"0x%02lX\","
+                     "\"read_back\":\"0x%02X\"}",
+                     (unsigned long)reg, before, (unsigned long)val, after);
+    } else {
+        n = snprintf(body, sizeof(body), "{\"reg\":\"0x%04lX\",\"value\":\"0x%02X\"}",
+                     (unsigned long)reg, after);
+    }
+    return send_response(sn, "200 OK", "application/json", body, (uint32_t)n);
+}
+#endif /* CAM_QB_DIAG */
+
 /* --------------------------------- Routing --------------------------------- */
 /*
  * Access class, for the authorization hook that later phases fill in. Phase 1
@@ -697,6 +782,9 @@ static const route_t g_routes[] = {
     { "/api/cam",      M_GET, ROUTE_ADMIN,  h_cam      },
     { "/api/clk",      M_GET, ROUTE_DIAG,   h_clk      },
     { "/load",         M_GET, ROUTE_DIAG,   h_load     },
+#if CAM_QB_DIAG
+    { "/api/diag/reg", M_GET, ROUTE_DIAG,   h_diag_reg },
+#endif
 };
 
 static const route_t *route_find(const char *path, size_t len)

@@ -18,6 +18,7 @@
 #include "stream_config.h"
 #include "cam_pipeline.h"
 #include "cam_state.h"
+#include "cam_driver.h"
 #include "dvp_capture.h"
 
 typedef enum { BUF_FREE = 0, BUF_FILLING, BUF_READY, BUF_SENDING } buf_state_t;
@@ -36,6 +37,16 @@ static volatile uint32_t  g_take_hit, g_take_miss, g_leaks;
 static volatile bool g_started;
 static volatile bool g_pause_req;
 static volatile bool g_paused;
+
+/* ---- control command slot (cam_pipeline.h) ---- */
+typedef enum { CMD_EMPTY = 0, CMD_POSTED, CMD_RUNNING, CMD_DONE } cmd_state_t;
+
+static cam_ctrl_batch_t     g_cmd_batch;
+static cam_ctrl_result_t    g_cmd_result;
+static volatile cmd_state_t g_cmd_state;
+static volatile bool        g_cmd_abandoned;   /* core 0 stopped waiting      */
+static cam_ctrl_written_t   g_written;
+static volatile uint32_t    g_cmd_applied, g_cmd_timeouts;
 
 /* Pick a buffer for the next capture: a free one, else the READY one that
  * nobody took (latest frame wins). Never the one being sent. */
@@ -64,6 +75,41 @@ static int claim_for_capture(void)
     return idx;
 }
 
+/* Core 1, between frames: write a posted control batch, record the result. */
+static void core1_service_command(void)
+{
+    if (g_cmd_state != CMD_POSTED) {
+        return;                                  /* cheap check, no lock */
+    }
+    critical_section_enter_blocking(&g_cs);
+    bool mine = (g_cmd_state == CMD_POSTED);     /* core 0 may have withdrawn it */
+    if (mine) g_cmd_state = CMD_RUNNING;
+    critical_section_exit(&g_cs);
+    if (!mine) {
+        return;
+    }
+
+    cam_ctrl_result_t res;
+    cam_ctrl_run(&g_cmd_batch, cam_sensor_set_control, &res);
+
+    critical_section_enter_blocking(&g_cs);
+    cam_ctrl_written_record(&g_written, &g_cmd_batch, &res);
+    g_cmd_result = res;
+    g_cmd_applied++;
+    if (g_cmd_abandoned) {
+        g_cmd_abandoned = false;                 /* nobody is waiting: free it */
+        g_cmd_state = CMD_EMPTY;
+    } else {
+        g_cmd_state = CMD_DONE;
+    }
+    critical_section_exit(&g_cs);
+
+    if (res.failed_at >= 0) {
+        printf("[ctrl] write %d of %u failed (rc %d), %u written before it\n",
+               res.failed_at + 1, (unsigned)g_cmd_batch.n, res.err, (unsigned)res.n_ok);
+    }
+}
+
 static void core1_capture_loop(void)
 {
     while (true) {
@@ -73,6 +119,7 @@ static void core1_capture_loop(void)
             g_paused = false;
             continue;
         }
+        core1_service_command();
         if (!cam_state_streaming()) {
             sleep_ms(2);
             continue;
@@ -206,6 +253,101 @@ void cam_pipeline_resume(void)
     if (!g_started || get_core_num() == 1) return;
     g_pause_req = false;
 }
+
+/* ---------------------------- Control commands ---------------------------- */
+const char *cam_cmd_rc_name(cam_cmd_rc_t rc)
+{
+    switch (rc) {
+    case CAM_CMD_OK:              return "ok";
+    case CAM_CMD_FAILED:          return "write failed";
+    case CAM_CMD_BUSY:            return "previous command still running";
+    case CAM_CMD_TIMEOUT_NOT_RUN: return "not started in time, withdrawn";
+    case CAM_CMD_TIMEOUT_RUNNING: return "started, not finished in time";
+    }
+    return "?";
+}
+
+cam_cmd_rc_t cam_pipeline_set_controls(const cam_ctrl_batch_t *b, cam_ctrl_result_t *res,
+                                       uint32_t timeout_ms)
+{
+    /* No capture loop to hand it to: the caller owns the sensor. */
+    if (!g_started || get_core_num() == 1) {
+        cam_ctrl_run(b, cam_sensor_set_control, res);
+        cam_ctrl_written_record(&g_written, b, res);
+        g_cmd_applied++;
+        return res->failed_at < 0 ? CAM_CMD_OK : CAM_CMD_FAILED;
+    }
+
+    critical_section_enter_blocking(&g_cs);
+    if (g_cmd_state != CMD_EMPTY) {
+        critical_section_exit(&g_cs);
+        return CAM_CMD_BUSY;
+    }
+    g_cmd_batch     = *b;
+    g_cmd_abandoned = false;
+    g_cmd_state     = CMD_POSTED;
+    critical_section_exit(&g_cs);
+
+    absolute_time_t until = make_timeout_time_ms(timeout_ms);
+    while (g_cmd_state != CMD_DONE &&
+           absolute_time_diff_us(get_absolute_time(), until) > 0) {
+        tight_loop_contents();
+    }
+
+    cam_cmd_rc_t rc;
+    critical_section_enter_blocking(&g_cs);
+    if (g_cmd_state == CMD_DONE) {
+        *res = g_cmd_result;
+        g_cmd_state = CMD_EMPTY;
+        rc = res->failed_at < 0 ? CAM_CMD_OK : CAM_CMD_FAILED;
+    } else if (g_cmd_state == CMD_POSTED) {
+        g_cmd_state = CMD_EMPTY;                 /* withdrawn: nothing written */
+        g_cmd_timeouts++;
+        rc = CAM_CMD_TIMEOUT_NOT_RUN;
+    } else {
+        g_cmd_abandoned = true;                  /* core 1 frees the slot later */
+        g_cmd_timeouts++;
+        rc = CAM_CMD_TIMEOUT_RUNNING;
+    }
+    critical_section_exit(&g_cs);
+    if (rc != CAM_CMD_OK && rc != CAM_CMD_FAILED) {
+        printf("[ctrl] %u control(s): %s after %lu ms\n", (unsigned)b->n,
+               cam_cmd_rc_name(rc), (unsigned long)timeout_ms);
+    }
+    return rc;
+}
+
+bool cam_pipeline_control_written(unsigned idx, int16_t *value)
+{
+    if (!g_started) {
+        return cam_ctrl_written_get(&g_written, idx, value);
+    }
+    critical_section_enter_blocking(&g_cs);
+    bool ok = cam_ctrl_written_get(&g_written, idx, value);
+    critical_section_exit(&g_cs);
+    return ok;
+}
+
+void cam_pipeline_controls_forget(const char *why)
+{
+    uint32_t had;
+    if (!g_started) {
+        had = g_written.mask;
+        cam_ctrl_written_clear(&g_written);
+    } else {
+        critical_section_enter_blocking(&g_cs);
+        had = g_written.mask;
+        cam_ctrl_written_clear(&g_written);
+        critical_section_exit(&g_cs);
+    }
+    if (had) {
+        printf("[ctrl] %s: written control values forgotten (sensor may not"
+               " have kept them)\n", why);
+    }
+}
+
+uint32_t cam_pipeline_cmd_applied(void)  { return g_cmd_applied; }
+uint32_t cam_pipeline_cmd_timeouts(void) { return g_cmd_timeouts; }
 
 uint32_t cam_pipeline_captured(void)    { return g_captured; }
 uint32_t cam_pipeline_overwritten(void) { return g_overwritten; }

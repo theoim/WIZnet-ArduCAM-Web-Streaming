@@ -134,6 +134,27 @@ int main(void)
     cam_pipeline_start();
 #endif
 
+#if CAM_QB_DIAG && STREAM_PIPELINE
+    /*
+     * Diagnostic image only: send empty control batches through the core 0 ->
+     * core 1 slot and time the round trip. An empty batch writes nothing to
+     * the sensor; this checks the hand-over itself (core 1 picks commands up
+     * between frames) before any real control uses it.
+     */
+    sleep_ms(1000);                     /* let core 1 get into its capture loop */
+    for (int i = 0; i < 5; i++) {
+        cam_ctrl_batch_t  empty;
+        cam_ctrl_result_t res = { 0, -1, 0 };
+        cam_ctrl_batch_init(&empty);
+        absolute_time_t t0 = get_absolute_time();
+        cam_cmd_rc_t rc = cam_pipeline_set_controls(&empty, &res, CAM_CMD_TIMEOUT_MS);
+        int64_t us = absolute_time_diff_us(t0, get_absolute_time());
+        printf("[ctrl-diag] empty command %d: %s in %lld us (streaming %d)\n", i + 1,
+               cam_cmd_rc_name(rc), (long long)us, cam_state_streaming() ? 1 : 0);
+        sleep_ms(137);                  /* land at different points of the frame */
+    }
+#endif
+
     printf("Initializing network (" STACK_NAME ")...\n");
     net_server_init();
 

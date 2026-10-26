@@ -16,8 +16,10 @@
 #include "stream_config.h"
 #include "cam_driver.h"
 #include "dvp_capture.h"
-#if STREAM_PIPELINE
+/* Always: the control slot and the written values live there, and work
+ * without the capture loop too (STREAM_PIPELINE 0 writes directly). */
 #include "cam_pipeline.h"
+#if STREAM_PIPELINE
 extern uint32_t g_push_calls;           /* server_toe.c */
 #endif
 #if defined(STREAM_HTTPS)
@@ -273,10 +275,12 @@ void cam_state_apply_resolution(res_t res)
     sleep_ms(200);                      /* let the sensor settle */
 
     /*
-     * set_frame_size() re-applies the clock dividers and puts the sensor back
-     * to its own defaults for everything else, so the panel would be showing
-     * values the hardware no longer has. Push the table back.
+     * A frame-size change may put the sensor back to its own defaults for
+     * everything else (the OV2640 tables do). Whether the Arducam controller
+     * keeps its control registers across one is not known, so the written
+     * values stop being claimed rather than shown as if they still held.
      */
+    cam_pipeline_controls_forget("frame size changed");
 
     cam_state_metrics_reset();          /* the old window described the old mode */
     printf("Resolution changed to %s\n", cam_state_res_string(res));
@@ -291,12 +295,13 @@ void cam_state_recover(void)
 #if STREAM_PIPELINE
     cam_pipeline_resume();
 #endif
+    cam_pipeline_controls_forget("sensor reset");
 
     /*
-     * Re-apply only the controls someone actually set. On the lwIP image this
-     * runs while the MCU *is* the TCP stack, so every extra I2C transaction
-     * here is time nothing is being acknowledged - and this path runs precisely
-     * when things are already going badly.
+     * Written controls are not pushed back after a reset: this path runs when
+     * the sensor has already stopped producing frames, and writing values that
+     * may be what broke it would only add to that. They are forgotten above
+     * instead, so nothing claims they still hold.
      */
 
     g_fail_streak = 0;

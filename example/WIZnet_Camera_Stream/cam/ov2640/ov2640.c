@@ -213,6 +213,26 @@ int cam_set_clock_div(uint8_t clk_div, uint8_t pll_div)
  * Reset the sensor and restore the current format, resolution, and clock.
  * Recovers from a stalled clock without power-cycling the board.
  */
+/*
+ * Image controls: none for now. The exhibition build's control table was
+ * dropped when this driver moved to cam/ (its ranges were marked provisional),
+ * and the OV2640 board shows intermittent corrupt frames that are being
+ * treated as a hardware fault. Controls come back after the new PCB has been
+ * verified, so that a picture change can be told apart from that fault.
+ */
+const cam_ctrl_desc_t *cam_sensor_controls(unsigned *count)
+{
+    *count = 0;
+    return NULL;
+}
+
+int cam_sensor_set_control(unsigned idx, int16_t value)
+{
+    (void)idx;
+    (void)value;
+    return -1;
+}
+
 int cam_recover(void)
 {
     int ret;
