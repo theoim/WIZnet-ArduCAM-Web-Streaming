@@ -102,7 +102,10 @@ void settings_boot(void)
         s_rec = rec;
         if (!rec.cam.sensor[0]) {
             s_note = "no camera settings saved";
-        } else if (strcmp(rec.cam.sensor, cam_caps.name) != 0) {
+        /* The field holds 15 characters; a longer driver name is stored cut
+         * ("Arducam Quick-Bootup 3MP DVP"), so compare what fits. A whole-name
+         * compare called every LH record "another sensor" (2026-10-26). */
+        } else if (strncmp(rec.cam.sensor, cam_caps.name, sizeof(rec.cam.sensor) - 1) != 0) {
             s_note = "saved on another sensor";
         } else {
             s_cam_ok = true;

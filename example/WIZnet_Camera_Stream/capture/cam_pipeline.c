@@ -162,6 +162,8 @@ static void core1_capture_loop(void)
 
         if (ok) {
             cam_state_note_capture_ok();
+        } else if (rc == -5) {
+            cam_state_note_too_big();          /* sensor fine, buffer too small */
         } else if (rc != 0) {
             /* Recovery resets the sensor over SCCB - core 1 owns it right now. */
             if (cam_state_note_capture_fail()) {

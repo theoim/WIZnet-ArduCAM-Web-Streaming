@@ -92,6 +92,7 @@ static volatile res_t g_resolution  = (res_t)0;   /* from cam_caps in cam_state_
 
 static uint32_t g_frame_count = 0;
 static uint32_t g_drop_count  = 0;
+static uint32_t g_too_big     = 0;      /* frames larger than the buffer */
 static uint32_t g_fail_streak = 0;
 
 /*
@@ -323,6 +324,14 @@ void cam_state_note_dropped(void)
     g_drop_count++;
 }
 
+/* A frame that did not fit the buffer: dropped, but the sensor is working, so
+ * it neither counts towards nor breaks a failure streak. */
+void cam_state_note_too_big(void)
+{
+    g_drop_count++;
+    g_too_big++;
+}
+
 bool cam_state_note_capture_fail(void)
 {
     g_drop_count++;
@@ -447,7 +456,7 @@ int cam_state_status_json(char *buf, size_t cap)
 
     n = snprintf(buf, cap,
                  "{\"streaming\":%s,\"res\":\"%s\","
-                 "\"frames\":%lu,\"dropped\":%lu,"
+                 "\"frames\":%lu,\"dropped\":%lu,\"too_big\":%lu,"
                  "\"fps\":%lu.%lu,\"vsync_ms\":%lu,\"read_ms\":%lu,"
                  "\"send_ms\":%lu,\"drain_ms\":%lu,\"kb\":%lu,"
                  "\"clk_div\":%u,\"pll_div\":%u,"
@@ -460,6 +469,7 @@ int cam_state_status_json(char *buf, size_t cap)
                  cam_state_res_string(g_resolution),
                  (unsigned long)g_frame_count,
                  (unsigned long)g_drop_count,
+                 (unsigned long)g_too_big,
                  (unsigned long)(fps_x10 / 10),
                  (unsigned long)(fps_x10 % 10),
                  (unsigned long)g_vsync_ms,

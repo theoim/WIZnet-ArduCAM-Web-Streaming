@@ -36,6 +36,7 @@ void        cam_state_recover(void);
 
 /* --------------------------------- Counters -------------------------------- */
 void        cam_state_note_dropped(void);
+void        cam_state_note_too_big(void);   /* larger than the frame buffer */
 /* A stream (re)open. why is the page's r= tag: open, err, idle, stall, back,
  * user, or "" for a request without one. */
 void        cam_state_note_stream_open(const char *why, size_t why_len);

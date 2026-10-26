@@ -481,7 +481,12 @@ static int32_t push_stream_frame(uint8_t sn)
     jpeg_size = fr.len;
 #else
     const uint8_t *jpeg = image_buff;
-    if (cam_capture_frame() != 0) {
+    int crc = cam_capture_frame();
+    if (crc == -5) {
+        cam_state_note_too_big();
+        return 1;
+    }
+    if (crc != 0) {
         if (cam_state_note_capture_fail()) {
             printf("No frames for %u attempts - sensor recovered\n",
                    FAIL_STREAK_RECOVER);

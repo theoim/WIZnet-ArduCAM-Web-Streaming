@@ -42,8 +42,8 @@ void cam_capture_init(void);
 
 /* Capture one frame into buf (4-byte aligned, cap bytes).
  * 0 = a complete JPEG (SOI..EOI), camera.frame_length bytes.
- * -1 bad frame, -2 VSYNC timeout, -3 DMA timeout, -4 no EOI (truncated or
- * larger than cap). Blocks for VSYNC: in the pipelined build only core 1 calls it. */
+ * -1 bad frame, -2 VSYNC timeout, -3 DMA timeout, -4 no EOI (the tail was
+ * lost), -5 the frame is larger than cap (the sensor is fine). Blocks for VSYNC: in the pipelined build only core 1 calls it. */
 int  cam_capture_frame_into(uint8_t *buf, uint32_t cap);
 
 /* Sequential build only (STREAM_PIPELINE 0): one 200 KB buffer. */

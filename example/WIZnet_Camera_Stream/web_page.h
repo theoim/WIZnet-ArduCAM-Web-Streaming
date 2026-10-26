@@ -118,6 +118,13 @@ static const char HTTP_INDEX_PAGE[] =
 ".acard .row2{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}\n"
 "#sec-acct .hint{margin-top:10px}\n"
 "#sec-acct{order:10}                    /* below the camera panels */\n"
+/* A result worth seeing from across the room: centred over the picture. */
+"#toast{position:absolute;top:56px;left:50%;transform:translateX(-50%);z-index:3;\n"
+"  padding:10px 22px;border-radius:10px;font-size:20px;font-weight:800;\n"
+"  color:#ffffff;background:rgba(16,20,24,.8);white-space:nowrap;max-width:90%;\n"
+"  overflow:hidden;text-overflow:ellipsis}\n"
+"#toast.ok{background:#1e9e4a}\n"
+"#toast.bad{background:var(--stop)}\n"
 "body.is-viewer #sec-ctrls,body.is-viewer #sec-res{display:none!important}\n"
 "main{max-width:1500px;margin:0 auto;padding:16px;display:grid;\n"
 "  grid-template-columns:minmax(0,1fr) 250px;gap:16px}\n"
@@ -427,6 +434,7 @@ static const char HTTP_INDEX_PAGE[] =
 "<div class='rate'><span><b id='h-fps'>-</b> fps</span>"
 "<span><b id='h-bw'>-</b> Mbps</span></div>"
 "<div class='resnow' id='resnow'>-</div></div>\n"
+"    <div id='toast' hidden></div>\n"
 /* No src here on purpose. With one, the browser opens the stream while this
    page is still being transferred, so the two compete for the same send path -
    and if the device is not streaming yet, that connection sits there holding a
@@ -765,7 +773,12 @@ static const char HTTP_INDEX_PAGE[] =
    The session is an HttpOnly cookie the page never sees. What the page keeps
    is the CSRF token from /api/auth, sent back on every POST. A 401 anywhere
    means the session is gone: ask /api/auth what to show. */
-"var AUTH={role:'none'},CSRF='',ctrlsLoaded=false;\n"
+"var AUTH={role:'none'},CSRF='',ctrlsLoaded=false,toastT=null;\n"
+"function toast(text,kind){\n"
+"  var t=$('toast');t.textContent=text;\n"
+"  t.className=kind===true?'ok':kind==='bad'?'bad':'';t.hidden=false;\n"
+"  clearTimeout(toastT);toastT=setTimeout(function(){t.hidden=true},kind===false?6000:3500);\n"
+"}\n"
 "function withCsrf(o){o.headers=o.headers||{};if(CSRF){o.headers['X-CSRF-Token']=CSRF}return o}\n"
 "function enc(o){var a=[];for(var k in o){a.push(encodeURIComponent(k)+'='+encodeURIComponent(o[k]))}\n"
 "  return a.join('&')}\n"
@@ -803,6 +816,10 @@ static const char HTTP_INDEX_PAGE[] =
 /* Logged out (or never in): stop the stream and wipe the last frame, so the
    picture does not stay on the page after the session that showed it. */
 "  if(typeof sCtl!=='undefined'&&sCtl){try{sCtl.abort()}catch(e){}sCtl=null}\n"
+/* ...and forget that a stream was ever opened, so the first status after the
+   next login opens it straight away. Without this the page waited for its
+   stall detector (8 polls, ~16 s) after a reboot ended the session. */
+"  if(typeof opened!=='undefined'){opened=false}\n"
 "  var cv=$('view');if(cv&&cv.getContext){cv.getContext('2d').clearRect(0,0,cv.width,cv.height)}\n"
 "  var setup=!a.provisioned;\n"
 "  $('authbox').hidden=false;\n"
@@ -894,7 +911,10 @@ static const char HTTP_INDEX_PAGE[] =
    means the connection is only ever opened against a device that has frames to
    put on it. force=true - this is the one opening that must not be held back
    by the reopen cooldown. */
-"  if(!opened&&s.streaming){opened=true;restartStream(true,'open')}\n"
+/* Only counts as opened when the login card is gone - restartStream() does
+   nothing while it shows, and a flag set then would leave the stream to the
+   stall detector after the login. */
+"  if(!opened&&s.streaming&&$('authbox').hidden){opened=true;restartStream(true,'open')}\n"
 "  misses=0;\n"
 "  $('s-res').textContent=s.res;\n"
 "  $('s-frames').textContent=s.frames;\n"
@@ -1023,6 +1043,14 @@ static const char HTTP_INDEX_PAGE[] =
 "      $('s-state').textContent='STREAMING';banner(null);\n"
 "    }\n"
 "  }\n"
+/* Frames bigger than the buffer are dropped by the device; at a size where
+   every frame is, the picture just stops. Say why. */
+/* Only when no frame got through since the last poll: at a size where some
+   frames fit, a banner every other poll was noise. */
+"  if(s.streaming&&last.too_big!==undefined&&s.too_big>last.too_big&&s.frames===last.frames){\n"
+"    banner('stall','Frames at '+(RESNAME[s.res]||s.res)+' are larger than the device\\'s '\n"
+"      +'96 KB frame buffer and are being dropped. Choose a smaller resolution.');\n"
+"  }\n"
 "  last=s;\n"
 "}\n"
 "function hint(s){\n"
@@ -1083,7 +1111,7 @@ static const char HTTP_INDEX_PAGE[] =
 "      var p=document.createElement('option');p.value=String(i);p.textContent=t;el.appendChild(p)});\n"
 "    el.onchange=function(){if(el.value!==''){sendCtrl(c.name,el.value)}};\n"
 "  }else if(c.type==='bool'){\n"
-"    el=document.createElement('input');el.type='checkbox';el.indeterminate=true;\n"
+"    el=document.createElement('input');el.type='checkbox';\n"
 "    el.onchange=function(){sendCtrl(c.name,el.checked?1:0)};\n"
 "  }else{\n"
 "    el=document.createElement('input');el.type='range';el.min=c.min;el.max=c.max;\n"
@@ -1114,7 +1142,10 @@ static const char HTTP_INDEX_PAGE[] =
 "  fetch('/api/settings/save',d.opt).then(function(r){\n"
 "    return r.text().then(function(t){\n"
 "      d.done();var j=null;try{j=JSON.parse(t)}catch(e){}\n"
-"      if(r.ok&&j){ctrlMsg('Saved; used at the next boot',false);render(j);return}\n"
+"      if(r.ok&&j){ctrlMsg('Saved; used at the next boot',false);render(j);\n"
+"        toast('\\u2713 Saved as default: '+(RESNAME[j.res]||j.res)+\n"
+"          ((j.settings&&j.settings.ctrl)?', '+j.settings.ctrl:''),true);return}\n"
+"      toast('Save failed',\"bad\");\n"
 "      ctrlMsg(r.status+': '+((j&&j.error)?j.error:t),true);\n"
 "    });\n"
 "  }).catch(function(){d.done();ctrlMsg('No reply: may or may not have been saved',true)});\n"
@@ -1147,7 +1178,10 @@ static const char HTTP_INDEX_PAGE[] =
    thumb back mid-drag. */
 "    if(!force&&document.activeElement===e.el){continue}\n"
 "    e.vl.textContent=has?String(v):'-';\n"
-"    if(e.c.type==='bool'){e.el.indeterminate=!has;e.el.checked=has&&!!v}\n"
+/* Two states only: not set since the last reset reads as off, which is what
+   the sensor's own initialisation gives. A third "-" state confused more than
+   it told (2026-10-26). */
+"    if(e.c.type==='bool'){e.el.checked=has&&!!v}\n"
 "    else if(e.c.type==='enum'){e.el.value=has?String(v):''}\n"
 "    else{e.el.value=has?v:((e.c.min<=0&&e.c.max>=0)?0:e.c.min)}\n"
 "  }\n"
@@ -1378,17 +1412,28 @@ static const char HTTP_INDEX_PAGE[] =
    visitor pressing the other button does not think it is broken. The pool was
    raised to 16 as well; this is the half that stops the burst from happening
    rather than the half that absorbs it. */
-"var RES_COOLDOWN=3000,lastRes_ms=0;\n"
+/* Inside the cooldown the choice used to be dropped without a word: the
+   drop-down showed UXGA while the camera stayed at HD (2026-10-26). Now it is
+   applied when the cooldown ends, and the page says so. */
+"var RES_COOLDOWN=3000,lastRes_ms=0,resTimer=null;\n"
 "function applyRes(v){\n"
-"  var now=Date.now();\n"
-"  if(now-lastRes_ms<RES_COOLDOWN){return}\n"
-"  lastRes_ms=now;\n"
+"  var wait=RES_COOLDOWN-(Date.now()-lastRes_ms);\n"
+"  clearTimeout(resTimer);\n"
+"  if(wait>0){\n"
+"    toast('Switching to '+(RESNAME[v]||v)+' in '+Math.ceil(wait/1000)+' s ...',false);\n"
+"    resTimer=setTimeout(function(){applyRes(v)},wait);\n"
+"    return;\n"
+"  }\n"
+"  lastRes_ms=Date.now();\n"
+"  toast('Switching to '+(RESNAME[v]||v)+' ...',false);\n"
 "  call('/api/res?v='+v).then(function(){\n"
 "    setTimeout(function(){restartStream(true)},400)})\n"
 "    .catch(offline);\n"
 "}\n"
 "$('res').onchange=function(){applyRes(this.value)};\n"
-"$('resbar').onchange=function(){applyRes(this.value)};\n"
+/* blur: while the drop-down keeps focus the poll will not correct it, so a
+   refused change would go on showing the size that was not applied. */
+"$('resbar').onchange=function(){this.blur();applyRes(this.value)};\n"
 "$('clk').oninput=function(){$('v-clk').textContent=this.value};\n"
 "$('pll').oninput=function(){$('v-pll').textContent=this.value};\n"
 "function applyClk(c,p){\n"

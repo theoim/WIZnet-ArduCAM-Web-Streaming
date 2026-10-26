@@ -311,9 +311,13 @@ retry_capture:
                 break;                  /* frame complete - stop reading padding */
             }
 
-            /* No room was left for another line, so nothing more will arrive. */
+            /* No room was left for another line: the frame is larger than
+             * the buffer. Not a sensor fault - the caller must not reset the
+             * sensor over it (2026-10-26: UXGA on the LH module reset the
+             * sensor every ten frames and froze the stream). */
             if(!room) {
-                goto badframe;
+                dma_channel_abort(camera.dma_channel);
+                return -5;
             }
         }
 
