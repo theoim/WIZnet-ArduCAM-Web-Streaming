@@ -926,8 +926,10 @@ static int auth_json(const sess_t *s, char *buf, size_t cap)
         user = g_db.acct[s->role == AUTH_ADMIN ? 0 : 1].user;
     }
     int n = snprintf(buf, cap,
-                     "{\"provisioned\":%s,\"setup_open\":%s,\"role\":\"%s\",\"user\":\"%s\",\"csrf\":\"%s\"",
+                     "{\"provisioned\":%s,\"setup_open\":%s,\"setup_serial\":%s,\"role\":\"%s\","
+                     "\"user\":\"%s\",\"csrf\":\"%s\"",
                      auth_provisioned(&g_db) ? "true" : "false", setup_open() ? "true" : "false",
+                     CAM_SETUP_SERIAL ? "true" : "false",
                      auth_role_name(s ? s->role : AUTH_NONE), user, csrf);
     if (n < 0 || (size_t)n >= cap) return -1;
     size_t used = (size_t)n;
@@ -1611,6 +1613,10 @@ void net_server_init(void)
         printf("[auth] NO ADMIN ACCOUNT - only the login page answers.\n"
 #if CAM_SETUP_SERIAL
                "[auth] type 'setup' + Enter on this console to open setup mode for 5 minutes\n"
+#else
+               "[auth] this image cannot open setup mode (no button on this PCB, and\n"
+               "[auth] CAM_SETUP_SERIAL is off): flash an image built with it ON to\n"
+               "[auth] create the admin, then flash this one again\n"
 #endif
                );
     }

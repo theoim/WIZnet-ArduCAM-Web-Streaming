@@ -75,11 +75,12 @@
 /* --------------------------------- Login ----------------------------------- */
 /*
  * Setup mode (creating the first admin) opens from a physical button in the
- * product (Q3). This PCB has no free pin for one, so the development build
- * opens it from the USB console instead: type "setup". 0 for a product build.
+ * product (Q3). This PCB has no free pin for one, so a development image can
+ * open it from the USB console instead: type "setup". Set by the CMake option
+ * CAM_SETUP_SERIAL, OFF by default.
  */
 #ifndef CAM_SETUP_SERIAL
-#define CAM_SETUP_SERIAL    1
+#define CAM_SETUP_SERIAL    0
 #endif
 
 /* --------------------------------- Platform -------------------------------- */

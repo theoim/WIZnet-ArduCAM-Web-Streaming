@@ -50,10 +50,23 @@ string(TIMESTAMP CAM_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 # only - nothing is written. Off in normal images.
 option(CAM_QB_DIAG "Log the Arducam controller's control registers (read only)" OFF)
 
+# Phase 3b: creating the first admin needs setup mode, which the product opens
+# from a physical button (Q3). This PCB has none, so a development image can
+# open it from the USB console ("setup"). OFF: no console path - an image that
+# also has no admin account yet cannot be set up; flash one built with this ON,
+# create the admin (it is kept in flash across UF2 updates), then flash back.
+option(CAM_SETUP_SERIAL "Open setup mode from the USB console (development only)" OFF)
+
 set(CAM_COMMON_DEFS
         CAM_MODULE_HEADER="modules/${CAMERA_MODULE}.h"
         CAM_BUILD_GIT="${CAM_BUILD_GIT}"
         CAM_BUILD_UTC="${CAM_BUILD_UTC}")
+if(CAM_SETUP_SERIAL)
+    list(APPEND CAM_COMMON_DEFS CAM_SETUP_SERIAL=1)
+    message(STATUS "camera_stream: CAM_SETUP_SERIAL on - 'setup' on the USB console opens setup mode")
+else()
+    list(APPEND CAM_COMMON_DEFS CAM_SETUP_SERIAL=0)
+endif()
 if(CAM_QB_DIAG)
     list(APPEND CAM_COMMON_DEFS CAM_QB_DIAG=1)
     message(STATUS "camera_stream: CAM_QB_DIAG on - control registers logged (read only)")
