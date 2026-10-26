@@ -119,6 +119,9 @@ static const char HTTP_INDEX_PAGE[] =
 "#sec-acct .hint{margin-top:10px}\n"
 "#sec-acct{order:10}                    /* below the camera panels */\n"
 /* A result worth seeing from across the room: centred over the picture. */
+"#elsewhere{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:3;\n"
+"  background:rgba(0,0,0,.78);color:#ffffff;border:1px solid rgba(255,255,255,.4);\n"
+"  border-radius:10px;padding:14px 20px;font-size:15px;cursor:pointer}\n"
 "#toast{position:absolute;top:56px;left:50%;transform:translateX(-50%);z-index:3;\n"
 "  padding:10px 22px;border-radius:10px;font-size:20px;font-weight:800;\n"
 "  color:#ffffff;background:rgba(16,20,24,.8);white-space:nowrap;max-width:90%;\n"
@@ -435,6 +438,7 @@ static const char HTTP_INDEX_PAGE[] =
 "<span><b id='h-bw'>-</b> Mbps</span></div>"
 "<div class='resnow' id='resnow'>-</div></div>\n"
 "    <div id='toast' hidden></div>\n"
+"    <button id='elsewhere' hidden>Playing in another tab &mdash; click to watch here</button>\n"
 /* No src here on purpose. With one, the browser opens the stream while this
    page is still being transferred, so the two compete for the same send path -
    and if the device is not streaming yet, that connection sits there holding a
@@ -1287,15 +1291,50 @@ static const char HTTP_INDEX_PAGE[] =
    resource and alternated live and black, 2026-10). */
 "var seq=Date.now(),lastRestart=0,RESTART_COOLDOWN=12000;\n"
 "var sCtl=null,sDrawn=0,sBad=0,lastFrameAt=Date.now(),lastErr=0,ERR_COOLDOWN=3000;\n"
-"var decoding=false,pendingJpg=null,pendingCtl=null;\n"
+"var decoding=false,pendingJpg=null,pendingCtl=null,IDLE_COOLDOWN=4000;\n"
+/* One stream per browser: the newest tab takes it and the others step back
+   instead of taking it again. The board gives a session's stream to its newest
+   connection, so two tabs of one login passed it back and forth, and the one
+   left over waited out RESTART_COOLDOWN with no picture (2026-10-27).
+
+   Newest means the newest claim, not the newest connection. A person opening
+   or clicking makes a claim; an automatic retry reuses the tab's old one. The
+   tab that lost the stream may retry before the message reaches it (seen on
+   the first try: the old tab's error retry won), so a tab holding a newer
+   claim answers an older one and the older tab steps back. */
+"var tabId=Math.random().toString(36).slice(2),yielded=false,bc=null,myClaim=0;\n"
+"try{bc=new BroadcastChannel('cam-stream')}catch(e){}\n"
+"function announce(){if(bc){try{bc.postMessage({t:'stream',id:tabId,ts:myClaim})}catch(e){}}}\n"
+"if(bc){bc.onmessage=function(e){\n"
+"  var d=e.data;\n"
+"  if(!d||d.t!=='stream'||d.id===tabId){return}\n"
+"  if(d.ts>myClaim||(d.ts===myClaim&&d.id>tabId)){yieldStream()}\n"
+"  else if(!yielded&&sCtl){announce()}      /* mine is newer: tell it */\n"
+"}}\n"
+"function yieldStream(){\n"
+"  yielded=true;\n"
+"  if(sCtl){try{sCtl.abort()}catch(e){}}\n"
+"  sCtl=null;\n"
+"  $('elsewhere').hidden=false;\n"
+"}\n"
+"$('elsewhere').onclick=function(){restartStream(true,'here')};\n"
 /* p= tells the board what the connection being replaced did: frames drawn,
    ms since the last one, parts that failed to decode. Printed next to the
    board's own count in "Stream opened ... page: n,ms,bad". */
 "function restartStream(force,why){\n"
 "  if(!$('authbox').hidden){return}       /* not logged in: no stream to ask for */\n"
+/* Automatic retries leave a stream another tab took alone; a click here or a
+   control used in this tab takes it back. */
+"  var auto=(why==='err'||why==='idle'||why==='stall'||why==='back');\n"
+"  if(yielded&&auto){return}\n"
 "  var now=Date.now();\n"
-"  if(!force&&now-lastRestart<RESTART_COOLDOWN){return}\n"
+/* No frame for 4 s is a picture already lost: retry on that clock, not the
+   long one meant for retries the status poll asks for. */
+"  if(!force&&now-lastRestart<(why==='idle'?IDLE_COOLDOWN:RESTART_COOLDOWN)){return}\n"
 "  lastRestart=now;\n"
+"  if(yielded){yielded=false;$('elsewhere').hidden=true}\n"
+"  if(!auto||!myClaim){myClaim=now}\n"
+"  announce();\n"
 "  var p=sDrawn+','+(now-lastFrameAt)+','+sBad;sDrawn=0;sBad=0;\n"
 "  if(sCtl){try{sCtl.abort()}catch(e){}}\n"
 "  var ctl=new AbortController();sCtl=ctl;pendingJpg=null;pendingCtl=null;\n"
@@ -1348,7 +1387,10 @@ static const char HTTP_INDEX_PAGE[] =
    TIME_WAIT each time). Inside the cooldown the watchdog below retries. */
 "    var n=Date.now();\n"
 "    if(n-lastErr<ERR_COOLDOWN){return}\n"
-"    lastErr=n;restartStream(true,'err');\n"
+/* Not at once: when another tab took the stream, its message is on the way
+   and this tab should step back, not take it again. */
+"    lastErr=n;\n"
+"    setTimeout(function(){if(ctl===sCtl&&!yielded){restartStream(true,'err')}},500);\n"
 "  });\n"
 "}\n"
 "function showFrame(jpg,ctl){\n"
