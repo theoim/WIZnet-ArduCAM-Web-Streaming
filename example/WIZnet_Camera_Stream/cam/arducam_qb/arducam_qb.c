@@ -314,22 +314,70 @@ int cam_set_pixformat(pixfmt_t fmt)
 }
 
 /*
- * Image controls. mega_ccm_regs.h names brightness, contrast, flip and others
- * at 0x0122-0x0134, but their value ranges and whether this module implements
- * them are not known yet (see qb_diag_read). Until a write test confirms
- * them, none are offered.
+ * Image controls, from the write tests on 2026-10-26 (diagnostic image,
+ * GET /api/diag/reg, LH module SENSOR_ID 0x039E):
+ *
+ *   flip    0x012B  0/1 turns the picture upside down and back. Reads 0xFF
+ *   mirror  0x012C  0/1 left-right and back. Reads 0xFF       whatever is written.
+ *   brightness 0x0122, saturation 0x0124, white balance 0x0126: a visible
+ *           change at 1. contrast 0x0123: frame size moves with the value
+ *           (odd larger, even smaller).
+ *   A sweep over the ranges below (test/qb_ctrl_sweep.py) never stopped or
+ *   corrupted capture: 30 fps throughout, no drops beyond the background.
+ *
+ * Brightness, contrast and saturation are not a scale 0..max. Checked by eye
+ * on the stream (2026-10-26) for all three: 0 is the default, odd codes go
+ * one way and even codes the other - brightness 3 brighter, 4 darker, 5
+ * brighter; contrast odd sharper, even flatter; saturation odd stronger, even
+ * weaker. That matches the contrast sweep (odd larger frames, even smaller).
+ * So the code is 0, +1, -1, +2, -2, ... and the table offers the signed level;
+ * qb_level_code() turns it into the register value. How big one step is has
+ * not been measured, so they stay PROVISIONAL.
+ *
+ * White balance is a mode number whose modes are not identified (1 gives a
+ * red cast), and it reads back a different value than written.
+ *
+ * Left out: sharpness 0x0128 (no visible change), and image quality 0x012A -
+ * several values stopped capture until core 1 reset the sensor, and the value
+ * written survived a full power cycle. The module appears to keep at least
+ * some settings in non-volatile memory.
  */
+static const char *const k_awb_modes[] = { "mode 0", "mode 1", "mode 2", "mode 3", "mode 4" };
+
+/* priv = register address, plus this bit when the value is a signed level */
+#define QB_LEVEL  0x10000u
+
+static const cam_ctrl_desc_t k_ctrls[] = {
+    /* name          label            type           flags                   min max  enum         reg */
+    { "brightness", "Brightness",    CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -4, 4,   NULL,        0x0122 | QB_LEVEL },
+    { "contrast",   "Contrast",      CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -3, 3,   NULL,        0x0123 | QB_LEVEL },
+    { "saturation", "Saturation",    CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -3, 3,   NULL,        0x0124 | QB_LEVEL },
+    { "awb",        "White balance", CAM_CTRL_ENUM, CAM_CTRL_F_PROVISIONAL, 0,  4,   k_awb_modes, 0x0126 },
+    { "flip",       "Flip",          CAM_CTRL_BOOL, 0,                      0,  1,   NULL,        0x012B },
+    { "mirror",     "Mirror",        CAM_CTRL_BOOL, 0,                      0,  1,   NULL,        0x012C },
+};
+#define QB_CTRL_COUNT ((unsigned)(sizeof(k_ctrls) / sizeof(k_ctrls[0])))
+
+/* Signed level -> register code: 0 -> 0, +n -> 2n-1, -n -> 2n. */
+static uint8_t qb_level_code(int16_t level)
+{
+    return level > 0 ? (uint8_t)(2 * level - 1) : (uint8_t)(-2 * level);
+}
+
 const cam_ctrl_desc_t *cam_sensor_controls(unsigned *count)
 {
-    *count = 0;
-    return NULL;
+    *count = QB_CTRL_COUNT;
+    return k_ctrls;
 }
 
 int cam_sensor_set_control(unsigned idx, int16_t value)
 {
-    (void)idx;
-    (void)value;
-    return -1;                       /* no table: nothing can name a control */
+    if (idx >= QB_CTRL_COUNT || value < k_ctrls[idx].min || value > k_ctrls[idx].max) {
+        return -1;                   /* cam_ctrl checked already; never write past it */
+    }
+    uint32_t priv = k_ctrls[idx].priv;
+    uint8_t  code = (priv & QB_LEVEL) ? qb_level_code(value) : (uint8_t)value;
+    return wr((uint16_t)(priv & 0xFFFFu), code);
 }
 
 int cam_recover(void)
