@@ -135,6 +135,7 @@ static sock_role_t g_role[HTTP_SOCK_COUNT];
  * stream is open, the loop is not reaching push_stream_frame() at all. */
 uint32_t g_push_calls;
 static int8_t      g_stream_sn = -1;
+static uint32_t    g_quick_close;      /* LAST_ACK/TIME_WAIT closed at once */
 /* What the current stream actually carried, printed when it ends. When the
  * page reopens because it drew nothing for 5 s (r=idle), "last sent N ms ago"
  * says which side stopped: a few ms means the board was still delivering and
@@ -1548,6 +1549,13 @@ static void socket_run(uint8_t sn)
         conn_on_closed(&g_conn, idx);
         if (socket(sn, TCP_SOCK_MODE, HTTP_PORT, 0x00) != sn) {
             printf("Socket %u open failed\n", sn);
+            return;
+        }
+        /* Listen in the same pass, not on the next one: a pass can be held up
+         * hundreds of ms by a login or a handshake on another socket, and a
+         * socket left in INIT meanwhile answers no SYN (2026-10-26). */
+        if (getSn_SR(sn) == SOCK_INIT && listen(sn) != SOCK_OK) {
+            printf("Socket %u listen failed\n", sn);
         }
         return;
 
@@ -1557,19 +1565,111 @@ static void socket_run(uint8_t sn)
         }
         return;
 
+    /*
+     * LAST_ACK and TIME_WAIT: our FIN is out and the peer's FIN has arrived -
+     * the response was delivered, all that is left is the peer's ACK of our
+     * FIN (or the 2*MSL wait). Close now instead of waiting. Measured
+     * 2026-10-26: back-to-back status polls left seven sockets in LAST_ACK
+     * for ~65 ms at a time with none in LISTEN, and the PC's SYN in that gap
+     * went unanswered until its retry 0.5 s / 1 s later.
+     */
+    case SOCK_LAST_ACK:
+    case SOCK_TIME_WAIT:
+        g_quick_close++;
+        close(sn);
+        release_stream_socket(sn);
+#if defined(STREAM_HTTPS)
+        tls_close(sn);
+#endif
+        conn_on_closed(&g_conn, idx);
+        if (socket(sn, TCP_SOCK_MODE, HTTP_PORT, 0x00) == sn && getSn_SR(sn) == SOCK_INIT) {
+            listen(sn);                   /* back in LISTEN within this pass */
+        }
+        return;
+
     default:
         return;                            /* LISTEN / SYNRECV / closing states */
     }
 }
 
 /* --------------------------------- Public ---------------------------------- */
+/*
+ * Longest single socket_run() since the last status report: core 0 serves the
+ * sockets one after another, so a run that takes long is time every other
+ * connection waits - the suspect for status polls that took ~1 s on the LH
+ * board (2026-10-26). Reported and reset by each status document; runs over
+ * SLOW_LOG_MS are also logged as they happen.
+ */
+#ifndef CAM_NET_DIAG
+#define CAM_NET_DIAG 0            /* 1: sample listener starvation (see listen_sample) */
+#endif
+#define SLOW_LOG_MS 300u
+static uint32_t g_slow_us;
+static uint8_t  g_slow_sn, g_slow_role, g_slow_phase;
+static uint32_t g_slow_total;           /* runs over SLOW_LOG_MS since boot */
+
+/*
+ * Listener starvation: a client's SYN that finds no socket in LISTEN is not
+ * answered, and the PC retries after 0.5 s / 1 s - exactly the connect times
+ * of the slow status polls (2026-10-26). Sampled once a millisecond; the
+ * longest span with no listener since the last status report, and the socket
+ * states when a span starts, are reported.
+ */
+static uint32_t g_nolisten_max_ms, g_nolisten_spans;
+static uint32_t g_nolisten_since;       /* ms, 0 = a listener exists */
+static uint32_t g_listen_sample_at;
+
+static void listen_sample(void)
+{
+#if !CAM_NET_DIAG
+    return;                       /* 8 SPI reads a millisecond: diagnostic builds only */
+#endif
+    uint32_t t = now_ms();
+    if (t == g_listen_sample_at) {
+        return;
+    }
+    g_listen_sample_at = t;
+    uint8_t sr[HTTP_SOCK_COUNT];
+    unsigned listening = 0;
+    for (uint8_t i = 0; i < HTTP_SOCK_COUNT; i++) {
+        sr[i] = getSn_SR((uint8_t)(SOCK_HTTP_BASE + i));
+        if (sr[i] == SOCK_LISTEN) listening++;
+    }
+    if (listening) {
+        if (g_nolisten_since) {
+            uint32_t span = t - g_nolisten_since;
+            if (span > g_nolisten_max_ms) g_nolisten_max_ms = span;
+            if (span >= 20u) {
+                printf("[listen] no listener for %lu ms\n", (unsigned long)span);
+            }
+            g_nolisten_since = 0;
+        }
+        return;
+    }
+    if (!g_nolisten_since) {
+        g_nolisten_since = t ? t : 1u;
+        g_nolisten_spans++;
+        printf("[listen] none listening: SR %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               sr[0], sr[1], sr[2], sr[3], sr[4], sr[5], sr[6], sr[7]);
+    }
+}
+
 int net_server_status_json(char *buf, size_t cap)
 {
     const uint32_t *c = g_conn.closes;
+    uint32_t slow_ms = g_slow_us / 1000u;
+    uint8_t  ssn = g_slow_sn, srole = g_slow_role, sphase = g_slow_phase;
+    uint32_t nl = g_nolisten_max_ms;
+    g_slow_us = 0;
+    g_nolisten_max_ms = 0;
     return snprintf(buf, cap,
+        "\"slow\":{\"ms\":%lu,\"sn\":%u,\"role\":\"%s\",\"phase\":%u,\"count\":%lu,"
+        "\"nolisten_ms\":%lu,\"nolisten_spans\":%lu,\"quick_close\":%lu},"
         "\"http\":{\"done\":%lu,\"parse\":%lu,\"to_hs\":%lu,\"to_req\":%lu,"
         "\"tls_err\":%lu,\"refused\":%lu,\"peer\":%lu,\"takeover\":%lu,"
         "\"send\":%lu,\"pool\":%lu,\"forced\":%lu,\"req_peak\":%u},",
+        (unsigned long)slow_ms, ssn, srole == SOCK_ROLE_STREAM ? "stream" : "http", sphase,
+        (unsigned long)g_slow_total, (unsigned long)nl, (unsigned long)g_nolisten_spans, (unsigned long)g_quick_close,
         (unsigned long)c[CONN_CLOSE_DONE], (unsigned long)c[CONN_CLOSE_PARSE],
         (unsigned long)c[CONN_CLOSE_TIMEOUT_HS], (unsigned long)c[CONN_CLOSE_TIMEOUT_REQ],
         (unsigned long)c[CONN_CLOSE_TLS], (unsigned long)c[CONN_CLOSE_TLS_REFUSED],
@@ -1685,7 +1785,22 @@ void net_server_service(void)
 {
     uint8_t i;
     for (i = 0; i < HTTP_SOCK_COUNT; i++) {
-        socket_run((uint8_t)(SOCK_HTTP_BASE + i));
+        uint8_t  sn    = (uint8_t)(SOCK_HTTP_BASE + i);
+        uint8_t  role  = g_role[i];
+        uint8_t  phase = (uint8_t)conn_phase(&g_conn, i);
+        uint64_t t0    = time_us_64();
+        socket_run(sn);
+        uint32_t d = (uint32_t)(time_us_64() - t0);
+        if (d > g_slow_us) {
+            g_slow_us = d; g_slow_sn = sn; g_slow_role = role; g_slow_phase = phase;
+        }
+        listen_sample();
+        if (d >= SLOW_LOG_MS * 1000u) {
+            g_slow_total++;
+            printf("[slow] s%u %s phase %u: %lu ms\n", sn,
+                   role == SOCK_ROLE_STREAM ? "stream" : "http", phase,
+                   (unsigned long)(d / 1000u));
+        }
     }
 #if CAM_AUTH
     auth_housekeeping();

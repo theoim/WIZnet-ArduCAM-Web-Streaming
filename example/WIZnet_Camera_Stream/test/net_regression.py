@@ -453,17 +453,45 @@ def t_slots(b, in_use):
     check("service returns once deadlines reclaim the slots", ok, f"{time.monotonic() - t0:.1f} s")
 
 
+def timed_status(b):
+    """One status poll, timed per phase: TCP connect, TLS handshake (and
+    whether the session was resumed), request to end of response."""
+    t0 = time.monotonic()
+    s = socket.create_connection((b.host, b.port), timeout=15)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    t1 = time.monotonic()
+    resumed = None
+    if not b.plain:
+        s = b.ctx.wrap_socket(s, server_hostname=b.host, session=b.session)
+        if s.session is not None:
+            b.session = s.session
+        resumed = s.session_reused
+    t2 = time.monotonic()
+    try:
+        s.sendall(b"GET /api/status HTTP/1.1\r\nHost: x\r\n" + b.auth_lines() + b"\r\n")
+        st = parse(read_all(s, 15))[0]
+    finally:
+        s.close()
+    t3 = time.monotonic()
+    return st, (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000, resumed
+
+
 def t_status(b, n):
     print("status")
-    lat, bad = [], 0
-    for _ in range(n):
+    lat, bad, rows = [], 0, []
+    for i in range(n):
         t0 = time.monotonic()
         try:
-            st, _, _ = parse(b.get("/api/status"))
+            st, c, h, q, res = timed_status(b)
+            rows.append((c + h + q, i, c, h, q, res))
         except Exception:
             st = 0
         lat.append((time.monotonic() - t0) * 1000)
         bad += st != 200
+    # where the time of the slowest polls went (2026-10-26: ~1 s outliers)
+    for tot, i, c, h, q, res in sorted(rows, reverse=True)[:3]:
+        print(f"  slow poll #{i}: {tot:.0f} ms = connect {c:.0f} + tls {h:.0f}"
+              f"{' (resumed)' if res else ' (FULL)' if res is False else ''} + request {q:.0f}")
     lat.sort()
     p = lambda q: lat[min(len(lat) - 1, int(q * len(lat)))]
     check(f"{n} status polls all 200", bad == 0,
@@ -494,12 +522,25 @@ class Stream:
         except (IndexError, ValueError):
             self.status = 0
 
-    def closed(self, wait=3.0):
+    def drain(self):
+        """Read whatever has arrived, without waiting."""
+        self.s.settimeout(0.0)
+        try:
+            while self.s.recv(65536):
+                pass
+        except (BlockingIOError, socket.timeout, ssl.SSLError, OSError):
+            pass
+
+    def closed(self, wait=3.0, also=()):
         """Did the server close it within wait s? Frames already buffered are
-        read through first; a live stream keeps sending until the deadline."""
+        read through first; a live stream keeps sending until the deadline.
+        Streams in also are drained meanwhile: one left unread fills its TCP
+        window and the server gives it up after its 2 s send timeout."""
         end = time.monotonic() + wait
-        self.s.settimeout(0.5)
         while time.monotonic() < end:
+            for o in also:
+                o.drain()
+            self.s.settimeout(0.2)
             try:
                 d = self.s.recv(65536)
             except socket.timeout:
@@ -571,11 +612,11 @@ def t_auth(b, a):
         check("viewer opens the stream -> 200", sv.status == 200, f"got {sv.status}")
         sv2 = Stream(b, v.sid)
         check("same viewer session reconnects -> 200, replaces its own",
-              sv2.status == 200 and sv.closed(3), f"got {sv2.status}")
+              sv2.status == 200 and sv.closed(3, also=[sv2]), f"got {sv2.status}")
         sv.close()
         sa = Stream(b, b.sid)
         check("admin opens while the viewer watches -> 200, viewer cut",
-              sa.status == 200 and sv2.closed(3), f"got {sa.status}")
+              sa.status == 200 and sv2.closed(3, also=[sa]), f"got {sa.status}")
         sv2.close()
         sv3 = Stream(b, v.sid)
         check("viewer opens while the admin watches -> 409, admin keeps it",
