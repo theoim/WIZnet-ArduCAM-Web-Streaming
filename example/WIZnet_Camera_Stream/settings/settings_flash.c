@@ -39,7 +39,15 @@ bool settings_flash_init(void)
         return false;
     }
     uint32_t chip   = 1u << rx[3];
-    uint32_t region = chip - 2u * SSTORE_SECTOR;
+    /*
+     * The two sectors BELOW the last one. The SDK's RP2350 UF2 carries an
+     * extra block at 0x10FFFF00 (family ABSOLUTE, the RP2350-E10 workaround).
+     * On this 2 MB part that address aliases into the last sector, so every
+     * UF2 download erased it: a record saved there was gone after the next
+     * firmware update (2026-10-26, the admin account vanished). The last
+     * sector is left to that block.
+     */
+    uint32_t region = chip - 3u * SSTORE_SECTOR;
     uint32_t image  = (uint32_t)((uintptr_t)&__flash_binary_end - XIP_BASE);
     if (image > region) {
         printf("[settings] firmware ends at 0x%06lX, past the store at 0x%06lX - store disabled\n",
