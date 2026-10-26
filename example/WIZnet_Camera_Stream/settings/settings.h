@@ -2,8 +2,9 @@
  * @file    settings.h
  * @brief   The camera's saved settings: what is kept, and when it is read.
  *
- * Schema 1 keeps the frame size and the control values that had been written
- * when the admin pressed Save. Nothing is saved automatically: a change made
+ * The record keeps the frame size and the control values that had been
+ * written when the admin pressed Save (schema 1), and the two accounts
+ * (schema 2, Phase 3b). Nothing is saved automatically: a change made
  * on the page lasts until reboot unless it is saved (decision Q7, 2026-10-23).
  *
  * A record is applied only on the sensor it was saved on - an OV2640 record
@@ -23,8 +24,16 @@
 #include <stdint.h>
 
 #include "cam_driver.h"
+#include "auth.h"
+
+#ifndef CAM_AUTH
+#define CAM_AUTH 0      /* 1 in the HTTPS build: login, accounts checked */
+#endif
 
 void settings_boot(void);
+
+/** One line on what was read at boot - again, for when the boot log was missed. */
+void settings_print(void);
 
 /** true and *res when the saved record names a size this sensor supports. */
 bool settings_boot_resolution(res_t *res);
@@ -38,6 +47,12 @@ void settings_apply_controls(void);
  * in @p why. *ms is how long the save held core 0.
  */
 int settings_save_current(char *why, size_t why_cap, uint32_t *ms);
+
+/** The saved accounts (all empty when nothing is saved). */
+const auth_db_t *settings_auth(void);
+
+/** Save new accounts; the camera part of the record is kept as it is. */
+int settings_save_auth(const auth_db_t *db, char *why, size_t why_cap, uint32_t *ms);
 
 /** "settings":{...} member for the status document (no leading comma). */
 int settings_status_json(char *buf, size_t cap);

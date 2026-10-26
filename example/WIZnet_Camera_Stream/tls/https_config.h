@@ -32,6 +32,7 @@
 #define MBEDTLS_CIPHER_C
 #define MBEDTLS_MD_C
 #define MBEDTLS_SHA256_C
+#define MBEDTLS_PKCS5_C                    /* PBKDF2 for stored passwords (Phase 3b) */
 #define MBEDTLS_CTR_DRBG_C
 #define MBEDTLS_ENTROPY_C
 

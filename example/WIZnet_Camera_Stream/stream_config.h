@@ -72,6 +72,16 @@
 #define STREAM_PIPELINE     1
 #endif
 
+/* --------------------------------- Login ----------------------------------- */
+/*
+ * Setup mode (creating the first admin) opens from a physical button in the
+ * product (Q3). This PCB has no free pin for one, so the development build
+ * opens it from the USB console instead: type "setup". 0 for a product build.
+ */
+#ifndef CAM_SETUP_SERIAL
+#define CAM_SETUP_SERIAL    1
+#endif
+
 /* --------------------------------- Platform -------------------------------- */
 #define PLL_SYS_KHZ         (200 * 1000)
 

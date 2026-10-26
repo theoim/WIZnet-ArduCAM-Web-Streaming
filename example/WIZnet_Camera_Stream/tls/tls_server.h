@@ -39,4 +39,7 @@ void    tls_close(uint8_t sn);               /* close_notify if possible, free; 
 /* For /api/status. */
 int     tls_status_json(char *buf, size_t cap);
 
+/* Random bytes from the TLS DRBG (TRNG-seeded). 0 on success. */
+int     tls_random(void *buf, size_t len);
+
 #endif /* TLS_SERVER_H */

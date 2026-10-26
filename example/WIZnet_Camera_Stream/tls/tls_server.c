@@ -180,6 +180,11 @@ bool tls_server_init(void)
 }
 
 /* ------------------------------------------------------------ lifecycle -- */
+int tls_random(void *buf, size_t len)
+{
+    return mbedtls_ctr_drbg_random(&g_drbg, buf, len);
+}
+
 bool tls_active(uint8_t sn) { return sn < TLS_SOCKETS && g_slot[sn].active; }
 bool tls_ready(uint8_t sn)  { return sn < TLS_SOCKETS && g_slot[sn].ready; }
 

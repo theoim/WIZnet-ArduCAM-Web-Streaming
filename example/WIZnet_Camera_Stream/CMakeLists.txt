@@ -102,7 +102,8 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/cam
             ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
             ${CMAKE_CURRENT_LIST_DIR}/capture
-            ${CMAKE_CURRENT_LIST_DIR}/settings)
+            ${CMAKE_CURRENT_LIST_DIR}/settings
+            ${CMAKE_CURRENT_LIST_DIR}/auth)
     target_compile_definitions(camera_stream PRIVATE ${CAM_COMMON_DEFS} NET_STACK_TOE=1)
     pico_generate_pio_header(camera_stream ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
     target_link_libraries(camera_stream PRIVATE
@@ -183,6 +184,8 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/settings/settings.c
                 ${CMAKE_CURRENT_LIST_DIR}/settings/settings_store.c
                 ${CMAKE_CURRENT_LIST_DIR}/settings/settings_flash.c
+                ${CMAKE_CURRENT_LIST_DIR}/auth/auth.c
+                ${CMAKE_CURRENT_LIST_DIR}/auth/session.c
                 ${CAM_SENSOR_SRC}
                 ${CMAKE_CURRENT_LIST_DIR}/tls/tls_server.c
                 ${CMAKE_CURRENT_LIST_DIR}/tls/https_cert.c
@@ -194,11 +197,12 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
                 ${CMAKE_CURRENT_LIST_DIR}/capture
                 ${CMAKE_CURRENT_LIST_DIR}/settings
+                ${CMAKE_CURRENT_LIST_DIR}/auth
                 ${CMAKE_CURRENT_LIST_DIR}/tls
                 ${MBEDTLS_DIR}/include
                 ${MBEDTLS_DIR}/library)
         target_compile_definitions(camera_stream_https PRIVATE
-                ${CAM_COMMON_DEFS} NET_STACK_TOE=1 STREAM_HTTPS=1
+                ${CAM_COMMON_DEFS} NET_STACK_TOE=1 STREAM_HTTPS=1 CAM_AUTH=1
                 MBEDTLS_CONFIG_FILE="${CMAKE_CURRENT_LIST_DIR}/tls/https_config.h")
         pico_generate_pio_header(camera_stream_https ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
         target_link_libraries(camera_stream_https PRIVATE

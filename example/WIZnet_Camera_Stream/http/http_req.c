@@ -402,6 +402,8 @@ static http_req_err_t parse_headers(http_req_t *r)
             e = set_once(r, HTTP_H_COOKIE, voff, vlen ? vlen : 1, HTTP_ERR_DUP_HEADER);
         } else if (ieq(ln, n, "Authorization")) {
             e = set_once(r, HTTP_H_AUTHORIZATION, voff, vlen ? vlen : 1, HTTP_ERR_DUP_HEADER);
+        } else if (ieq(ln, n, "X-CSRF-Token")) {
+            e = set_once(r, HTTP_H_CSRF, voff, vlen ? vlen : 1, HTTP_ERR_DUP_HEADER);
         } else if (ieq(ln, n, "Content-Type")) {
             e = set_once(r, HTTP_H_CONTENT_TYPE, voff, vlen ? vlen : 1, HTTP_ERR_DUP_HEADER);
         } else if (ieq(ln, n, "Connection")) {

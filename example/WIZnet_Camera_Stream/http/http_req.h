@@ -116,6 +116,7 @@ typedef enum {
     HTTP_H_AUTHORIZATION,
     HTTP_H_CONTENT_TYPE,
     HTTP_H_CONNECTION,
+    HTTP_H_CSRF,                        /* X-CSRF-Token (Phase 3b) */
     HTTP_H_COUNT_
 } http_header_id_t;
 

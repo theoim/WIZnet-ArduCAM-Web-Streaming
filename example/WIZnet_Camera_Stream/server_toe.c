@@ -50,6 +50,10 @@
 #include "dvp_capture.h"
 #include "cam_pipeline.h"       /* frame buffers, and the control command slot */
 #include "settings.h"
+#if CAM_AUTH
+#include "session.h"
+#include "tls_server.h"
+#endif
 #include "web_page.h"
 #include "logo_png.h"
 #if defined(STREAM_HTTPS)
@@ -139,6 +143,19 @@ static uint32_t        g_stream_frames;
 static absolute_time_t g_stream_opened_at, g_stream_last_sent;
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
+
+#if CAM_AUTH
+/* ------------------------------ Login state -------------------------------- */
+static sess_table_t  g_sess;
+static auth_db_t     g_db;              /* copy of the saved accounts        */
+static uint64_t      g_setup_until;     /* setup mode open until (ms), 0 shut */
+static const sess_t *g_req_sess;        /* session of the request in dispatch */
+static uint32_t      g_stream_owner;    /* session id streaming, 0 = none     */
+static auth_role_t   g_stream_role;
+
+static uint64_t now64(void) { return time_us_64() / 1000u; }
+static bool setup_open(void) { return g_setup_until && now64() < g_setup_until; }
+#endif
 static uint8_t  sock_idx(uint8_t sn) { return (uint8_t)(sn - SOCK_HTTP_BASE); }
 
 /* ------------------------------- TCP helpers ------------------------------- */
@@ -315,6 +332,9 @@ static void release_stream_socket(uint8_t sn)
     g_role[sock_idx(sn)] = SOCK_ROLE_HTTP;
     if (g_stream_sn == (int8_t)sn) {
         g_stream_sn = -1;
+#if CAM_AUTH
+        g_stream_owner = 0;
+#endif
         stream_summary("Stream closed on", sn);
     }
 }
@@ -371,6 +391,25 @@ static int32_t begin_stream(uint8_t sn, const char *why, size_t why_len,
      * moment; refusing the new one would leave a dead picture on screen, which
      * at an exhibition is the failure this whole build exists to avoid.
      */
+#if CAM_AUTH
+    /*
+     * One viewer at a time (Q4): the same session reconnecting takes its own
+     * stream back - the old connection is usually half-open after a reload -
+     * an admin takes it from a viewer, and anyone else is refused while the
+     * current stream stays up.
+     */
+    if (g_stream_sn >= 0 && g_stream_sn != (int8_t)sn && g_req_sess) {
+        sess_stream_t p = sess_stream_policy(g_stream_owner, g_stream_role,
+                                             g_req_sess->id, g_req_sess->role);
+        if (p == SESS_STREAM_REFUSE) {
+            printf("Stream refused on socket %u: %s session %lu is watching\n", sn,
+                   auth_role_name(g_stream_role), (unsigned long)g_stream_owner);
+            static const char busy[] = "{\"error\":\"the stream is in use by another session\"}";
+            return send_response_hdrs(sn, "409 Conflict", "application/json", "Retry-After: 10\r\n",
+                                      busy, (uint32_t)(sizeof(busy) - 1));
+        }
+    }
+#endif
     if (g_stream_sn >= 0 && g_stream_sn != (int8_t)sn) {
         uint8_t old = (uint8_t)g_stream_sn;
         printf("Stream taken over: socket %u -> %u (r=%.*s)\n", old, sn,
@@ -388,6 +427,10 @@ static int32_t begin_stream(uint8_t sn, const char *why, size_t why_len,
 
     g_role[sock_idx(sn)] = SOCK_ROLE_STREAM;
     g_stream_sn = (int8_t)sn;
+#if CAM_AUTH
+    g_stream_owner = g_req_sess ? g_req_sess->id : 0;
+    g_stream_role  = g_req_sess ? g_req_sess->role : AUTH_NONE;
+#endif
     g_stream_frames = 0;
     g_stream_opened_at = get_absolute_time();
     g_stream_last_sent = g_stream_opened_at;
@@ -813,6 +856,278 @@ static int32_t h_settings_save(uint8_t sn, const http_req_t *r)
     return send_status(sn, false);
 }
 
+#if defined(STREAM_HTTPS)
+#include "mbedtls/pkcs5.h"
+/*
+ * GET /api/diag/pbkdf2?n=<iterations> - time one PBKDF2-HMAC-SHA256 on this
+ * core, to pick the stored-password iteration count from a measurement
+ * (Phase 3b). Core 0 is held for the duration.
+ */
+static int32_t h_diag_pbkdf2(uint8_t sn, const http_req_t *r)
+{
+    char v[8];
+    size_t vn = query_value(r, "n", v, sizeof(v));
+    uint32_t n = 0;
+    for (size_t i = 0; i < vn; i++) {
+        if (v[i] < '0' || v[i] > '9') { n = 0; break; }
+        n = n * 10u + (uint32_t)(v[i] - '0');
+    }
+    if (n == 0 || n > 200000u) {
+        return send_error(sn, 400, NULL);
+    }
+    static const uint8_t salt[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    uint8_t out[32];
+    absolute_time_t t0 = get_absolute_time();
+    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const uint8_t *)"benchmark", 9,
+                                           salt, sizeof(salt), n, sizeof(out), out);
+    uint32_t us = (uint32_t)absolute_time_diff_us(t0, get_absolute_time());
+    printf("[auth] PBKDF2-SHA256 %lu iterations: %lu ms (rc %d)\n",
+           (unsigned long)n, (unsigned long)(us / 1000), rc);
+    int k = snprintf(g_json, sizeof(g_json), "{\"iterations\":%lu,\"us\":%lu,\"rc\":%d}",
+                     (unsigned long)n, (unsigned long)us, rc);
+    return send_response(sn, "200 OK", "application/json", g_json, (uint32_t)k);
+}
+#endif
+
+#if CAM_AUTH
+/* ------------------------------- Login (3b) -------------------------------- */
+#define SID_COOKIE_ATTR "; Path=/; Secure; HttpOnly; SameSite=Strict"
+
+static size_t body_value(const http_req_t *r, const char *key, char *out, size_t cap)
+{
+    size_t blen = 0;
+    const uint8_t *b = http_req_body(r, &blen);
+    int n = http_query_get(b, blen, key, out, cap);
+    if (n < 0) {
+        out[0] = 0;
+        return 0;
+    }
+    return (size_t)n;
+}
+
+static void wipe(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+    while (n--) *v++ = 0;
+}
+
+/* {"provisioned":..,"setup_open":..,"role":..,"user":..,"csrf":..,"viewer":{..}} */
+static int auth_json(const sess_t *s, char *buf, size_t cap)
+{
+    char csrf[SESS_HEX_LEN + 1] = "";
+    const char *user = "";
+    if (s) {
+        sess_hex(s->csrf, csrf);
+        user = g_db.acct[s->role == AUTH_ADMIN ? 0 : 1].user;
+    }
+    int n = snprintf(buf, cap,
+                     "{\"provisioned\":%s,\"setup_open\":%s,\"role\":\"%s\",\"user\":\"%s\",\"csrf\":\"%s\"",
+                     auth_provisioned(&g_db) ? "true" : "false", setup_open() ? "true" : "false",
+                     auth_role_name(s ? s->role : AUTH_NONE), user, csrf);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    size_t used = (size_t)n;
+    if (s && s->role == AUTH_ADMIN) {
+        n = snprintf(buf + used, cap - used, ",\"viewer\":{\"present\":%s,\"enabled\":%s,\"user\":\"%s\"}",
+                     g_db.acct[1].present ? "true" : "false",
+                     g_db.acct[1].enabled ? "true" : "false", g_db.acct[1].user);
+        if (n < 0 || (size_t)n >= cap - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(buf + used, cap - used, "}");
+    if (n < 0 || (size_t)n >= cap - used) return -1;
+    return (int)(used + (size_t)n);
+}
+
+/* A new session for @p role, answered with its cookie and the auth document. */
+static int32_t start_session(uint8_t sn, auth_role_t role)
+{
+    uint8_t rnd[2 * SESS_TOKEN_LEN];
+    if (tls_random(rnd, sizeof(rnd)) != 0) {
+        return send_json_error(sn, "500 Internal Server Error", NULL, "no randomness", NULL);
+    }
+    const sess_t *s = sess_create(&g_sess, role, rnd, now64());
+    wipe(rnd, sizeof(rnd));
+    char tok[SESS_HEX_LEN + 1], cookie[128];
+    sess_hex(s->token, tok);
+    snprintf(cookie, sizeof(cookie), "Set-Cookie: " SESS_COOKIE "=%s" SID_COOKIE_ATTR "; Max-Age=%lu\r\n",
+             tok, (unsigned long)(SESS_ABS_MS / 1000u));
+    wipe(tok, sizeof(tok));
+    int n = auth_json(s, g_json, sizeof(g_json));
+    int32_t rc = send_response_hdrs(sn, "200 OK", "application/json", cookie, g_json, (uint32_t)n);
+    wipe(cookie, sizeof(cookie));
+    return rc;
+}
+
+/* GET /api/auth - who is this, and does the device need setting up. Public:
+ * the page asks before it knows whether it is logged in. */
+static int32_t h_auth(uint8_t sn, const http_req_t *r)
+{
+    size_t clen = 0;
+    const char *ck = (const char *)http_req_header(r, HTTP_H_COOKIE, &clen);
+    const sess_t *s = sess_lookup(&g_sess, ck, clen, now64(), true);
+    int n = auth_json(s, g_json, sizeof(g_json));
+    return send_response(sn, "200 OK", "application/json", g_json, (uint32_t)n);
+}
+
+/* POST /api/login  user=..&pass=.. */
+static int32_t h_login(uint8_t sn, const http_req_t *r)
+{
+    if (!auth_provisioned(&g_db)) {
+        return send_json_error(sn, "403 Forbidden", NULL, "setup required", NULL);
+    }
+    uint32_t retry = 0;
+    if (!sess_login_allowed(&g_sess, now64(), &retry)) {
+        char ra[32];
+        snprintf(ra, sizeof(ra), "Retry-After: %lu\r\n", (unsigned long)((retry + 999u) / 1000u));
+        return send_json_error(sn, "429 Too Many Requests", ra, "too many failed logins; wait", NULL);
+    }
+    char user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2];
+    size_t ul = body_value(r, "user", user, sizeof(user));
+    size_t pl = body_value(r, "pass", pass, sizeof(pass));
+    absolute_time_t t0 = get_absolute_time();
+    auth_role_t role = auth_verify(&g_db, user, ul, pass, pl);
+    wipe(pass, sizeof(pass));
+    sess_login_result(&g_sess, role != AUTH_NONE, now64());
+    printf("[auth] login '%s': %s (%lu ms)\n", role != AUTH_NONE ? user : "?",
+           role != AUTH_NONE ? auth_role_name(role) : "refused",
+           (unsigned long)(absolute_time_diff_us(t0, get_absolute_time()) / 1000));
+    if (role == AUTH_NONE) {
+        return send_json_error(sn, "401 Unauthorized", NULL, "wrong user name or password", NULL);
+    }
+    return start_session(sn, role);
+}
+
+/* POST /api/logout */
+static int32_t h_logout(uint8_t sn, const http_req_t *r)
+{
+    (void)r;
+    uint32_t id = g_req_sess->id;
+    sess_end(&g_sess, id);
+    g_req_sess = NULL;
+    if (g_stream_owner == id && g_stream_sn >= 0) {
+        conn_teardown((uint8_t)g_stream_sn, CONN_CLOSE_TAKEOVER);
+    }
+    static const char ok[] = "{\"ok\":true}";
+    return send_response_hdrs(sn, "200 OK", "application/json",
+                              "Set-Cookie: " SESS_COOKIE "=" SID_COOKIE_ATTR "; Max-Age=0\r\n",
+                              ok, (uint32_t)(sizeof(ok) - 1));
+}
+
+/* Salt, set, save; g_db only changes when the save succeeded. */
+static int set_account(auth_role_t role, const char *user, size_t ul, const char *pass, size_t pl,
+                       char *why, size_t why_cap)
+{
+    auth_db_t db = g_db;
+    uint8_t salt[AUTH_SALT_LEN];
+    if (tls_random(salt, sizeof(salt)) != 0) {
+        snprintf(why, why_cap, "no randomness");
+        return -1;
+    }
+    auth_err_t e = auth_set(&db, role, user, ul, pass, pl, salt, AUTH_ITER_DEFAULT);
+    if (e != AUTH_OK) {
+        snprintf(why, why_cap, "%s", auth_err_name(e));
+        return -1;
+    }
+    uint32_t ms = 0;
+    if (settings_save_auth(&db, why, why_cap, &ms) != 0) {
+        return -1;
+    }
+    g_db = db;
+    wipe(&db, sizeof(db));
+    return 0;
+}
+
+/* POST /api/setup  user=..&pass=..  - only while setup mode is open and no
+ * admin exists. Creates the admin and logs it in. */
+static int32_t h_setup(uint8_t sn, const http_req_t *r)
+{
+    if (auth_provisioned(&g_db)) {
+        return send_json_error(sn, "409 Conflict", NULL, "already set up", NULL);
+    }
+    if (!setup_open()) {
+        return send_json_error(sn, "403 Forbidden", NULL, "setup mode is not open", NULL);
+    }
+    char user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2], why[64];
+    size_t ul = body_value(r, "user", user, sizeof(user));
+    size_t pl = body_value(r, "pass", pass, sizeof(pass));
+    int rc = set_account(AUTH_ADMIN, user, ul, pass, pl, why, sizeof(why));
+    wipe(pass, sizeof(pass));
+    if (rc != 0) {
+        return send_json_error(sn, "400 Bad Request", NULL, why, NULL);
+    }
+    g_setup_until = 0;
+    printf("[auth] admin '%s' created; setup mode closed\n", user);
+    return start_session(sn, AUTH_ADMIN);
+}
+
+/* End every session of @p role except @p keep. */
+static void end_role_except(auth_role_t role, uint32_t keep)
+{
+    for (unsigned i = 0; i < SESS_MAX; i++) {
+        if (g_sess.s[i].used && g_sess.s[i].role == role && g_sess.s[i].id != keep) {
+            sess_end(&g_sess, g_sess.s[i].id);
+        }
+    }
+}
+
+/*
+ * POST /api/account (admin)
+ *   role=admin&old=..&pass=..[&user=..]   change the admin password (old required)
+ *   role=viewer&user=..&pass=..           set the viewer
+ *   role=viewer&enabled=0|1               switch the viewer off/on
+ * Sessions of the changed account end; the admin's own session stays.
+ */
+static int32_t h_account(uint8_t sn, const http_req_t *r)
+{
+    char role_s[8], user[AUTH_USER_MAX + 2], pass[AUTH_PASS_MAX + 2], old[AUTH_PASS_MAX + 2];
+    char en[4], why[64];
+    body_value(r, "role", role_s, sizeof(role_s));
+    size_t ul = body_value(r, "user", user, sizeof(user));
+    size_t pl = body_value(r, "pass", pass, sizeof(pass));
+    size_t ol = body_value(r, "old", old, sizeof(old));
+    size_t el = body_value(r, "enabled", en, sizeof(en));
+    int rc = -1;
+    uint32_t me = g_req_sess->id;
+
+    if (strcmp(role_s, "admin") == 0) {
+        const char *name = ul ? user : g_db.acct[0].user;
+        size_t nl = ul ? ul : strlen(g_db.acct[0].user);
+        if (auth_verify(&g_db, g_db.acct[0].user, strlen(g_db.acct[0].user), old, ol) != AUTH_ADMIN) {
+            snprintf(why, sizeof(why), "current password is wrong");
+        } else {
+            rc = set_account(AUTH_ADMIN, name, nl, pass, pl, why, sizeof(why));
+            if (rc == 0) end_role_except(AUTH_ADMIN, me);
+        }
+    } else if (strcmp(role_s, "viewer") == 0 && el && !pl) {
+        if (!g_db.acct[1].present) {
+            snprintf(why, sizeof(why), "no viewer account");
+        } else {
+            auth_db_t db = g_db;
+            uint32_t ms;
+            auth_viewer_enable(&db, en[0] == '1');
+            rc = settings_save_auth(&db, why, sizeof(why), &ms);
+            if (rc == 0) {
+                g_db = db;
+                if (!db.acct[1].enabled) sess_end_role(&g_sess, AUTH_VIEWER);
+            }
+        }
+    } else if (strcmp(role_s, "viewer") == 0) {
+        rc = set_account(AUTH_VIEWER, user, ul, pass, pl, why, sizeof(why));
+        if (rc == 0) sess_end_role(&g_sess, AUTH_VIEWER);
+    } else {
+        snprintf(why, sizeof(why), "role must be admin or viewer");
+    }
+    wipe(pass, sizeof(pass));
+    wipe(old, sizeof(old));
+    if (rc != 0) {
+        return send_json_error(sn, "400 Bad Request", NULL, why, NULL);
+    }
+    printf("[auth] account %s updated\n", role_s);
+    int n = auth_json(g_req_sess, g_json, sizeof(g_json));
+    return send_response(sn, "200 OK", "application/json", g_json, (uint32_t)n);
+}
+#endif /* CAM_AUTH */
+
 /* /api/res?v=<WxH> */
 static int32_t h_res(uint8_t sn, const http_req_t *r)
 {
@@ -966,14 +1281,26 @@ static const route_t g_routes[] = {
     { "/snapshot.jpg", M_GET, ROUTE_VIEW,   h_snapshot },
     { "/api/status",   M_GET, ROUTE_VIEW,   h_status   },
     { "/api/controls", M_GET, ROUTE_VIEW,   h_controls },
-    { "/api/start",    M_GET, ROUTE_ADMIN,  h_start    },
-    { "/api/stop",     M_GET, ROUTE_ADMIN,  h_stop     },
-    { "/api/reset",    M_GET, ROUTE_ADMIN,  h_reset    },
-    { "/api/res",      M_GET, ROUTE_ADMIN,  h_res      },
+    /* State changes are POST (Q1): with a session, a POST also needs the
+     * X-CSRF-Token header. The frame size still rides in the query. */
+    { "/api/start",    M_POST, ROUTE_ADMIN, h_start    },
+    { "/api/stop",     M_POST, ROUTE_ADMIN, h_stop     },
+    { "/api/reset",    M_POST, ROUTE_ADMIN, h_reset    },
+    { "/api/res",      M_POST, ROUTE_ADMIN, h_res      },
+#if CAM_AUTH
+    { "/api/auth",     M_GET, ROUTE_PUBLIC, h_auth     },
+    { "/api/login",    M_POST, ROUTE_PUBLIC, h_login   },
+    { "/api/setup",    M_POST, ROUTE_PUBLIC, h_setup   },
+    { "/api/logout",   M_POST, ROUTE_VIEW,  h_logout   },
+    { "/api/account",  M_POST, ROUTE_ADMIN, h_account  },
+#endif
     { "/api/cam",      M_POST, ROUTE_ADMIN, h_cam      },
     { "/api/settings/save", M_POST, ROUTE_ADMIN, h_settings_save },
     { "/api/clk",      M_GET, ROUTE_DIAG,   h_clk      },
     { "/load",         M_GET, ROUTE_DIAG,   h_load     },
+#if defined(STREAM_HTTPS)
+    { "/api/diag/pbkdf2", M_GET, ROUTE_DIAG, h_diag_pbkdf2 },
+#endif
 #if CAM_QB_DIAG
     { "/api/diag/reg", M_GET, ROUTE_DIAG,   h_diag_reg },
 #endif
@@ -991,11 +1318,27 @@ static const route_t *route_find(const char *path, size_t len)
 }
 
 /* Phase 1: everything is allowed. Later phases decide here, and only here. */
-static bool route_authorize(const route_t *rt, const http_req_t *r)
+/* 0 to serve, else the status code; *why for the JSON body. */
+static int route_authorize(const route_t *rt, const http_req_t *r, const char **why)
 {
+#if CAM_AUTH
+    static const sess_need_t need[] = {
+        [ROUTE_PUBLIC] = SESS_NEED_NONE, [ROUTE_VIEW] = SESS_NEED_VIEWER,
+        [ROUTE_ADMIN] = SESS_NEED_ADMIN, [ROUTE_DIAG] = SESS_NEED_ADMIN,
+    };
+    size_t clen = 0, xlen = 0;
+    const char *ck = (const char *)http_req_header(r, HTTP_H_COOKIE, &clen);
+    const char *x  = (const char *)http_req_header(r, HTTP_H_CSRF, &xlen);
+    g_req_sess = sess_lookup(&g_sess, ck, clen, now64(), true);
+    bool post = http_req_method(r) == HTTP_METHOD_POST;
+    return sess_policy(need[rt->access], auth_provisioned(&g_db), g_req_sess, post,
+                       sess_csrf_ok(g_req_sess, x, xlen), why);
+#else
     (void)rt;
     (void)r;
-    return true;
+    *why = "ok";
+    return 0;
+#endif
 }
 
 static void allow_header(const route_t *rt, char *out, size_t cap)
@@ -1016,6 +1359,8 @@ static void dispatch(uint8_t sn, const http_req_t *r)
 #endif
     const route_t *rt = route_find(path, plen);
     int32_t rc;
+    int deny;
+    const char *why = "";
 
     if (!rt) {
         rc = send_error(sn, 404, NULL);
@@ -1023,8 +1368,8 @@ static void dispatch(uint8_t sn, const http_req_t *r)
         char allow[32];
         allow_header(rt, allow, sizeof(allow));
         rc = send_error(sn, 405, allow);
-    } else if (!route_authorize(rt, r)) {
-        rc = send_error(sn, 403, NULL);
+    } else if ((deny = route_authorize(rt, r, &why)) != 0) {
+        rc = send_json_error(sn, deny == 401 ? "401 Unauthorized" : "403 Forbidden", NULL, why, NULL);
     } else {
         rc = rt->fn(sn, r);
     }
@@ -1250,6 +1595,21 @@ void net_server_init(void)
     for (i = 0; i < HTTP_SOCK_COUNT; i++) {
         g_role[i] = SOCK_ROLE_HTTP;
     }
+    settings_print();               /* USB serial is usually attached by now */
+#if CAM_AUTH
+    sess_init(&g_sess);
+    g_db = *settings_auth();
+    if (auth_provisioned(&g_db)) {
+        printf("[auth] admin '%s'%s; login required\n", g_db.acct[0].user,
+               g_db.acct[1].present ? (g_db.acct[1].enabled ? ", viewer on" : ", viewer off") : "");
+    } else {
+        printf("[auth] NO ADMIN ACCOUNT - only the login page answers.\n"
+#if CAM_SETUP_SERIAL
+               "[auth] type 'setup' + Enter on this console to open setup mode for 5 minutes\n"
+#endif
+               );
+    }
+#endif
 
     printf("HTTP camera server ready (" STACK_NAME ", %u listeners, %u request contexts)\n",
            (unsigned)HTTP_SOCK_COUNT, (unsigned)CONN_REQ_POOL);
@@ -1262,12 +1622,63 @@ void net_server_init(void)
            g_net_info.ip[2], g_net_info.ip[3]);
 }
 
+#if CAM_AUTH
+/*
+ * Once a second: a stream whose session ended (expired, logged out elsewhere,
+ * password changed) is closed - a long-lived connection must not outlive
+ * the login that opened it. And the setup-mode console.
+ */
+static void auth_housekeeping(void)
+{
+    static uint32_t last;
+    uint32_t t = now_ms();
+#if CAM_SETUP_SERIAL
+    /* Development build only: no setup button on this PCB yet (Q3 asks for a
+     * physical one). 'setup' typed on the USB console opens setup mode. */
+    static char line[16];
+    static uint8_t len;
+    int c;
+    while ((c = getchar_timeout_us(0)) >= 0) {
+        if (c == '\r' || c == '\n') {
+            line[len] = 0;
+            if (strcmp(line, "setup") == 0) {
+                if (auth_provisioned(&g_db)) {
+                    printf("[auth] already set up - setup mode not opened\n");
+                } else {
+                    g_setup_until = now64() + 5u * 60u * 1000u;
+                    printf("[auth] setup mode OPEN for 5 minutes - create the admin in the browser\n");
+                }
+            }
+            len = 0;
+        } else if (len + 1u < sizeof(line)) {
+            line[len++] = (char)c;
+        }
+    }
+#endif
+    if (t - last < 1000u) {
+        return;
+    }
+    last = t;
+    if (g_stream_owner && g_stream_sn >= 0 && !sess_alive(&g_sess, g_stream_owner, now64())) {
+        printf("[auth] session %lu ended - closing its stream\n", (unsigned long)g_stream_owner);
+        conn_teardown((uint8_t)g_stream_sn, CONN_CLOSE_TAKEOVER);
+    }
+    if (g_setup_until && now64() >= g_setup_until) {
+        g_setup_until = 0;
+        printf("[auth] setup mode closed (timeout)\n");
+    }
+}
+#endif
+
 void net_server_service(void)
 {
     uint8_t i;
     for (i = 0; i < HTTP_SOCK_COUNT; i++) {
         socket_run((uint8_t)(SOCK_HTTP_BASE + i));
     }
+#if CAM_AUTH
+    auth_housekeeping();
+#endif
 }
 
 #endif /* NET_STACK_TOE */

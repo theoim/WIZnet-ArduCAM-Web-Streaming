@@ -20,7 +20,17 @@ What it checks, and why each matters:
   slots       four idle TLS connections, a fifth is refused, service returns
               once the deadlines reclaim them
   status      200 status polls: all 200, latency p50/p95/max
+  auth        (HTTPS) 401 without a session, 403 for a viewer on admin routes
+              and for a POST without the CSRF token, the one-stream rules,
+              logout, and the login throttle (slow; skipped with --quick)
 Counters from /api/status "http" are printed before and after.
+
+The HTTPS image needs a login. Credentials come from the command line or the
+environment, never from this file:
+    CAM_ADMIN_USER / CAM_ADMIN_PASS   (--user / --password)
+    CAM_VIEWER_USER / CAM_VIEWER_PASS (--vuser / --vpass, optional)
+Every request below then carries the admin session cookie and CSRF token,
+unless a test asks for an anonymous one.
 
 The CA certificate (public) is read from ~/.camera-stream-ca/ca.crt when it
 exists; otherwise certificate checks are off. No private key is touched.
@@ -54,6 +64,31 @@ class Board:
         # is a full ECDHE handshake (~200 ms of board CPU), which measures the
         # handshake and stalls a running stream instead of testing HTTP.
         self.session = None
+        self.sid = None                       # login cookie value
+        self.csrf = None
+
+    def auth_lines(self):
+        if not self.sid:
+            return b""
+        return (b"Cookie: cam_sid=" + self.sid.encode() + b"\r\n" +
+                b"X-CSRF-Token: " + self.csrf.encode() + b"\r\n")
+
+    def login(self, user, password):
+        """Returns (status, auth document); keeps the cookie on success."""
+        body = ("user=%s&pass=%s" % (user, password)).encode()
+        st, hdr, data = parse(self.roundtrip(
+            b"POST /api/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(body) + body, anon=True))
+        doc = {}
+        try:
+            doc = json.loads(data)
+        except ValueError:
+            pass
+        if st == 200:
+            ck = hdr.get("set-cookie", "")
+            self.sid = ck.split("cam_sid=", 1)[1].split(";", 1)[0] if "cam_sid=" in ck else None
+            self.csrf = doc.get("csrf")
+        return st, doc
 
     def connect(self, handshake=True, timeout=15.0):
         s = socket.create_connection((self.host, self.port), timeout=timeout)
@@ -69,8 +104,13 @@ class Board:
             self.session = t.session
         return t
 
-    def roundtrip(self, raw, timeout=15.0, chunks=None, gap=0.0):
-        """Send raw bytes (optionally in chunks with a gap), read until close."""
+    def roundtrip(self, raw, timeout=15.0, chunks=None, gap=0.0, anon=False):
+        """Send raw bytes (optionally in chunks with a gap), read until close.
+        The session lines go in after the request line unless anon, or the
+        request brings its own Cookie, or it has no CRLF line end at all."""
+        i = raw.find(b"\r\n")
+        if not anon and self.sid and i > 0 and b"\r\nCookie:" not in raw:
+            raw = raw[:i + 2] + self.auth_lines() + raw[i + 2:]
         s = self.connect(timeout=timeout)
         try:
             if chunks:
@@ -84,9 +124,14 @@ class Board:
         finally:
             s.close()
 
-    def get(self, path, extra=b""):
+    def get(self, path, extra=b"", anon=False):
         req = b"GET " + path.encode() + b" HTTP/1.1\r\nHost: " + self.host.encode() + b"\r\n" + extra + b"\r\n"
-        return self.roundtrip(req)
+        return self.roundtrip(req, anon=anon)
+
+    def post(self, path, body=b"", extra=b"", anon=False):
+        req = (b"POST " + path.encode() + b" HTTP/1.1\r\nHost: " + self.host.encode() + b"\r\n" + extra +
+               b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        return self.roundtrip(req, anon=anon)
 
     def status(self):
         st, hdr, body = parse(self.get("/api/status"))
@@ -252,7 +297,7 @@ def t_snapshot(b):
             check(f"streaming: snapshot {i + 1} -> 200 JPEG ({len(body)} B, {ms:.0f} ms)",
                   jpeg_ok(st, hdr, body) and ms < 2500, f"got {st} {hdr.get('content-type')}")
         check("streaming flag untouched", (b.status() or {}).get("streaming") is True)
-    parse(b.get("/api/stop"))
+    parse(b.post("/api/stop"))
     try:
         for i in range(2):
             st, hdr, body, ms = snap(b)
@@ -261,7 +306,7 @@ def t_snapshot(b):
         check("stopped: stream stays stopped", (b.status() or {}).get("streaming") is False)
     finally:
         if was:
-            parse(b.get("/api/start"))
+            parse(b.post("/api/start"))
     st, _, _ = parse(b.roundtrip(b"POST /snapshot.jpg HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"))
     check("POST /snapshot.jpg -> 405", st == 405, f"got {st}")
 
@@ -277,7 +322,8 @@ def t_split(b):
 
 def t_limits(b):
     print("limits")
-    st, _, _ = parse(b.get("/api/status", b"Cookie: " + b"a" * 1200 + b"\r\n"))
+    sid = (b"; cam_sid=" + b.sid.encode()) if b.sid else b""
+    st, _, _ = parse(b.get("/api/status", b"Cookie: a=" + b"a" * 1150 + sid + b"\r\n"))
     check("1.2 KB cookie -> 200", st == 200, f"got {st}")
     st, _, _ = parse(b.get("/api/status", b"X-Pad: " + b"a" * 1600 + b"\r\n"))
     check("header block > 1536 B -> 431", st == 431, f"got {st}")
@@ -424,14 +470,157 @@ def t_status(b, n):
           f"{bad} failed, p50 {p(0.5):.0f} ms, p95 {p(0.95):.0f} ms, max {lat[-1]:.0f} ms")
 
 
+class Stream:
+    """An open /stream: request sent, response head read, socket kept."""
+    def __init__(self, b, sid):
+        self.s = b.connect(timeout=8)
+        req = b"GET /stream?r=test HTTP/1.1\r\nHost: x\r\n"
+        if sid:
+            req += b"Cookie: cam_sid=" + sid.encode() + b"\r\n"
+        self.s.sendall(req + b"\r\n")
+        self.s.settimeout(5)
+        head = b""
+        try:
+            while b"\r\n\r\n" not in head and len(head) < 4096:
+                d = self.s.recv(4096)
+                if not d:
+                    break
+                head += d
+        except (socket.timeout, ssl.SSLError, OSError):
+            pass
+        self.head = head
+        try:
+            self.status = int(head.split(b"\r\n", 1)[0].split()[1])
+        except (IndexError, ValueError):
+            self.status = 0
+
+    def closed(self, wait=3.0):
+        """Did the server close it within wait s? Frames already buffered are
+        read through first; a live stream keeps sending until the deadline."""
+        end = time.monotonic() + wait
+        self.s.settimeout(0.5)
+        while time.monotonic() < end:
+            try:
+                d = self.s.recv(65536)
+            except socket.timeout:
+                continue
+            except (ssl.SSLError, OSError):
+                return True
+            if not d:
+                return True
+        return False
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def t_auth(b, a):
+    if b.plain or not b.sid:
+        print("auth: skipped (plain image or no login)")
+        return
+    print("auth (3b)")
+    st, _, body = parse(b.get("/api/auth", anon=True))
+    doc = json.loads(body) if st == 200 else {}
+    check("GET /api/auth anonymous -> provisioned, role none",
+          doc.get("provisioned") is True and doc.get("role") == "none" and not doc.get("csrf"), str(doc))
+    for path in ("/api/status", "/api/controls", "/snapshot.jpg", "/stream"):
+        st, _, _ = parse(b.get(path, anon=True))
+        check(f"GET {path} without a session -> 401", st == 401, f"got {st}")
+    st, _, _ = parse(b.get("/", anon=True))
+    check("GET / without a session -> 200 (page shell is public)", st == 200, f"got {st}")
+    st, _, _ = parse(b.get("/api/status", b"Cookie: cam_sid=" + b"0" * 32 + b"\r\n", anon=True))
+    check("unknown session cookie -> 401", st == 401, f"got {st}")
+    st, _, body = parse(b.post("/api/start", extra=b"Cookie: cam_sid=" + b.sid.encode() + b"\r\n", anon=True))
+    check("admin POST without X-CSRF-Token -> 403", st == 403 and b"CSRF" in body, f"got {st} {body[:60]!r}")
+    st, _, _ = parse(b.post("/api/start", extra=b"Cookie: cam_sid=" + b.sid.encode() +
+                            b"\r\nX-CSRF-Token: " + b"f" * 32 + b"\r\n", anon=True))
+    check("admin POST with a wrong CSRF token -> 403", st == 403, f"got {st}")
+    st, _, _ = parse(b.post("/api/start"))
+    check("admin POST with the token -> 200", st == 200, f"got {st}")
+    st, _, _ = parse(b.post("/api/setup", b"user=x&pass=xxxxxxxxxx"))
+    check("POST /api/setup once set up -> 409", st == 409, f"got {st}")
+    st, _, _ = parse(b.get("/api/start"))
+    check("GET /api/start -> 405 (state changes are POST)", st == 405, f"got {st}")
+
+    v = None
+    if a.vuser and a.vpass:
+        v = Board(b.host, b.port, b.plain)
+        st, doc = v.login(a.vuser, a.vpass)
+        check("viewer login -> 200, role viewer", st == 200 and doc.get("role") == "viewer", f"got {st}")
+        st, _, _ = parse(v.get("/api/status"))
+        check("viewer GET /api/status -> 200", st == 200, f"got {st}")
+        st, _, _ = parse(v.get("/snapshot.jpg"))
+        check("viewer GET /snapshot.jpg -> 200", st == 200, f"got {st}")
+        st, _, body = parse(v.post("/api/cam", b"brightness=0",
+                                   b"Content-Type: application/x-www-form-urlencoded\r\n"))
+        check("viewer POST /api/cam -> 403 admin only", st == 403 and b"admin" in body, f"got {st}")
+        for path in ("/api/stop", "/api/settings/save", "/api/account"):
+            st, _, _ = parse(v.post(path))
+            check(f"viewer POST {path} -> 403", st == 403, f"got {st}")
+        st, _, _ = parse(v.get("/load?kb=1"))
+        check("viewer GET diagnostic /load -> 403", st == 403, f"got {st}")
+        st, _, _ = parse(b.post("/api/stop", extra=b"Cookie: cam_sid=" + b.sid.encode() +
+                                b"\r\nX-CSRF-Token: " + v.csrf.encode() + b"\r\n", anon=True))
+        check("admin cookie with the viewer's CSRF token -> 403", st == 403, f"got {st}")
+
+        # one stream at a time (Q4)
+        sv = Stream(b, v.sid)
+        check("viewer opens the stream -> 200", sv.status == 200, f"got {sv.status}")
+        sv2 = Stream(b, v.sid)
+        check("same viewer session reconnects -> 200, replaces its own",
+              sv2.status == 200 and sv.closed(3), f"got {sv2.status}")
+        sv.close()
+        sa = Stream(b, b.sid)
+        check("admin opens while the viewer watches -> 200, viewer cut",
+              sa.status == 200 and sv2.closed(3), f"got {sa.status}")
+        sv2.close()
+        sv3 = Stream(b, v.sid)
+        check("viewer opens while the admin watches -> 409, admin keeps it",
+              sv3.status == 409 and not sa.closed(3), f"got {sv3.status}")
+        sv3.close()
+        sa.close()
+        time.sleep(1)
+
+        st, _, _ = parse(v.post("/api/logout"))
+        check("viewer logout -> 200", st == 200, f"got {st}")
+        st, _, _ = parse(v.get("/api/status"))
+        check("after logout the cookie is dead -> 401", st == 401, f"got {st}")
+    else:
+        print("  (no viewer credentials: viewer and stream-rule checks skipped)")
+
+    if a.quick:
+        return
+    print("  throttle: 5 wrong passwords, then locked for 30 s")
+    t = Board(b.host, b.port, b.plain)
+    codes = [t.login(a.user, "wrong-password-%d" % i)[0] for i in range(5)]
+    check("5 wrong passwords -> 401 each", codes == [401] * 5, str(codes))
+    st, _ = t.login(a.user, a.password)
+    check("6th try, even the right password -> 429", st == 429, f"got {st}")
+    time.sleep(31)
+    st, _ = t.login(a.user, a.password)
+    check("after 30 s the right password works", st == 200, f"got {st}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.11.7")
     ap.add_argument("--plain", action="store_true", help="port 80 image (camera_stream)")
     ap.add_argument("--quick", action="store_true", help="skip the drip test")
     ap.add_argument("--polls", type=int, default=200)
+    ap.add_argument("--user", default=os.environ.get("CAM_ADMIN_USER"))
+    ap.add_argument("--password", default=os.environ.get("CAM_ADMIN_PASS"))
+    ap.add_argument("--vuser", default=os.environ.get("CAM_VIEWER_USER"))
+    ap.add_argument("--vpass", default=os.environ.get("CAM_VIEWER_PASS"))
     a = ap.parse_args()
     b = Board(a.host, 80 if a.plain else 443, a.plain)
+    if not a.plain and a.user and a.password:
+        st, doc = b.login(a.user, a.password)
+        if st != 200:
+            print(f"admin login failed: {st} {doc}"); return 2
+        print(f"logged in as {doc.get('user')} ({doc.get('role')})")
 
     before = b.status()
     if not before:
@@ -449,6 +638,7 @@ def main():
     # tls_conns counts the status request's own session too
     t_slots(b, max(0, int(before.get("tls_conns", 1)) - 1))
     t_status(b, a.polls)
+    t_auth(b, a)
     after = b.status() or {}
     print(f"http counters after: {after.get('http')}")
     print(f"sram_used before {before.get('sram_used')} after {after.get('sram_used')}, "

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host tests for the HTTP request parser, connection table, camera controls and settings store. No board, no Pico SDK.
+# Host tests for the HTTP request parser, connection table, camera controls, settings store and accounts. No board, no Pico SDK.
 #
 #   example/WIZnet_Camera_Stream/test/run_host_tests.sh
 #
@@ -35,11 +35,23 @@ gcc -std=c99 $WARN $DEFS -O1 -g -c     "$src/cam/cam_ctrl.c" -o "$out/cam_ctrl.o
 gcc -std=c99 $TWARN $DEFS -O1 -g     -I"$src/cam" "$here/cam_ctrl_test.c" "$out/cam_ctrl.o" -o "$out/cam_ctrl_test"
 gcc -std=c99 $WARN $DEFS -O1 -g -c "$src/settings/settings_store.c" -o "$out/settings_store.o"
 gcc -std=c99 $TWARN $DEFS -O1 -g -I"$src/settings" "$here/settings_store_test.c" "$out/settings_store.o" -o "$out/settings_store_test"
+# auth.c against the real mbedTLS PBKDF2 - the library sources the board uses.
+mb="$src/../../libraries/mbedtls"
+MBDEFS="-DMBEDTLS_CONFIG_FILE=\"host_mbedtls_config.h\" -I$here -I$mb/include -I$mb/library"
+for f in md sha256 pkcs5 platform_util platform; do
+    gcc -std=c99 $DEFS $MBDEFS -O1 -c "$mb/library/$f.c" -o "$out/mb_$f.o"
+done
+gcc -std=c99 $WARN $DEFS $MBDEFS -O1 -g -c "$src/auth/auth.c" -o "$out/auth.o"
+gcc -std=c99 $TWARN $DEFS $MBDEFS -O1 -g -I"$src/auth" "$here/auth_test.c" "$out/auth.o"     "$out"/mb_md.o "$out"/mb_sha256.o "$out"/mb_pkcs5.o "$out"/mb_platform_util.o "$out"/mb_platform.o -o "$out/auth_test"
+gcc -std=c99 $WARN $DEFS -O1 -g -I"$src/auth" -c "$src/auth/session.c" -o "$out/session.o"
+gcc -std=c99 $TWARN $DEFS -O1 -g -I"$src/auth" "$here/session_test.c" "$out/session.o" -o "$out/session_test"
 echo "== host run"
 "$out/http_req_test"
 "$out/conn_test"
 "$out/cam_ctrl_test"
 "$out/settings_store_test"
+"$out/auth_test"
+"$out/session_test"
 
 if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
     echo "== arm cross-compile (size only, not linked)"
@@ -49,7 +61,8 @@ if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
         "$src/http/conn.c" -o "$out/conn.arm.o"
     arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c         "$src/cam/cam_ctrl.c" -o "$out/cam_ctrl.arm.o"
     arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c "$src/settings/settings_store.c" -o "$out/settings_store.arm.o"
-    arm-none-eabi-size "$out/http_req.arm.o" "$out/conn.arm.o" "$out/cam_ctrl.arm.o" "$out/settings_store.arm.o"
+    arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -I"$src/auth" -c "$src/auth/session.c" -o "$out/session.arm.o"
+    arm-none-eabi-size "$out/http_req.arm.o" "$out/conn.arm.o" "$out/cam_ctrl.arm.o" "$out/settings_store.arm.o" "$out/session.arm.o"
 else
     echo "== arm-none-eabi-gcc not on PATH, cross-compile skipped"
 fi
