@@ -26,6 +26,7 @@ extern uint32_t g_push_calls;           /* server_toe.c */
 #include "tls_server.h"
 #endif
 #include "net_server.h"
+#include "settings.h"
 
 /* ------------------------------ SRAM reporting ----------------------------- */
 /*
@@ -192,6 +193,11 @@ void cam_state_set_streaming(bool on)
         g_drop_count  = 0;
         cam_state_metrics_reset();
     }
+}
+
+void cam_state_set_boot_resolution(res_t res)
+{
+    g_resolution = res;
 }
 
 res_t cam_state_resolution(void)
@@ -504,6 +510,19 @@ int cam_state_status_json(char *buf, size_t cap)
                  (unsigned long)cam_pipeline_cmd_applied(),
                  (unsigned long)cam_pipeline_cmd_timeouts());
     if (n < 0 || (size_t)n >= cap - used) {
+        return -1;
+    }
+    used += (size_t)n;
+
+    /* build: which image is running - the boot log is usually gone by the time
+     * USB serial is attached. settings: what is saved in flash. */
+    n = snprintf(buf + used, cap - used, ",\"build\":\"%s\",", CAM_BUILD_GIT);
+    if (n < 0 || (size_t)n >= cap - used) {
+        return -1;
+    }
+    used += (size_t)n;
+    n = settings_status_json(buf + used, cap - used);
+    if (n < 0) {
         return -1;
     }
     used += (size_t)n;

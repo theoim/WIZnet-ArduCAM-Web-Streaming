@@ -49,6 +49,7 @@
 #include "cam_driver.h"
 #include "dvp_capture.h"
 #include "cam_pipeline.h"       /* frame buffers, and the control command slot */
+#include "settings.h"
 #include "web_page.h"
 #include "logo_png.h"
 #if defined(STREAM_HTTPS)
@@ -796,6 +797,22 @@ static int32_t h_cam(uint8_t sn, const http_req_t *r)
     }
 }
 
+/*
+ * POST /api/settings/save - keep the current frame size and the written
+ * control values across a reboot. Saving is the only way anything reaches
+ * flash. The body is ignored. Core 0 is held for the erase and program.
+ */
+static int32_t h_settings_save(uint8_t sn, const http_req_t *r)
+{
+    (void)r;
+    char why[64];
+    uint32_t ms = 0;
+    if (settings_save_current(why, sizeof(why), &ms) != 0) {
+        return send_json_error(sn, "500 Internal Server Error", NULL, why, NULL);
+    }
+    return send_status(sn, false);
+}
+
 /* /api/res?v=<WxH> */
 static int32_t h_res(uint8_t sn, const http_req_t *r)
 {
@@ -954,6 +971,7 @@ static const route_t g_routes[] = {
     { "/api/reset",    M_GET, ROUTE_ADMIN,  h_reset    },
     { "/api/res",      M_GET, ROUTE_ADMIN,  h_res      },
     { "/api/cam",      M_POST, ROUTE_ADMIN, h_cam      },
+    { "/api/settings/save", M_POST, ROUTE_ADMIN, h_settings_save },
     { "/api/clk",      M_GET, ROUTE_DIAG,   h_clk      },
     { "/load",         M_GET, ROUTE_DIAG,   h_load     },
 #if CAM_QB_DIAG

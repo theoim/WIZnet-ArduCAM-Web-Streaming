@@ -91,6 +91,9 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
             ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
             ${CMAKE_CURRENT_LIST_DIR}/cam/cam_ctrl.c
+            ${CMAKE_CURRENT_LIST_DIR}/settings/settings.c
+            ${CMAKE_CURRENT_LIST_DIR}/settings/settings_store.c
+            ${CMAKE_CURRENT_LIST_DIR}/settings/settings_flash.c
             ${CAM_SENSOR_SRC})
 
     target_include_directories(camera_stream PRIVATE
@@ -98,12 +101,13 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/http
             ${CMAKE_CURRENT_LIST_DIR}/cam
             ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
-            ${CMAKE_CURRENT_LIST_DIR}/capture)
+            ${CMAKE_CURRENT_LIST_DIR}/capture
+            ${CMAKE_CURRENT_LIST_DIR}/settings)
     target_compile_definitions(camera_stream PRIVATE ${CAM_COMMON_DEFS} NET_STACK_TOE=1)
     pico_generate_pio_header(camera_stream ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
     target_link_libraries(camera_stream PRIVATE
             pico_stdlib hardware_dma hardware_i2c hardware_pio hardware_pwm
-            hardware_gpio hardware_clocks pico_multicore
+            hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash
             ETHERNET_FILES IOLIBRARY_FILES)
 
     pico_enable_stdio_usb(camera_stream 1)
@@ -176,6 +180,9 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/capture/cam_pipeline.c
                 ${CMAKE_CURRENT_LIST_DIR}/cam/cam_sccb.c
                 ${CMAKE_CURRENT_LIST_DIR}/cam/cam_ctrl.c
+                ${CMAKE_CURRENT_LIST_DIR}/settings/settings.c
+                ${CMAKE_CURRENT_LIST_DIR}/settings/settings_store.c
+                ${CMAKE_CURRENT_LIST_DIR}/settings/settings_flash.c
                 ${CAM_SENSOR_SRC}
                 ${CMAKE_CURRENT_LIST_DIR}/tls/tls_server.c
                 ${CMAKE_CURRENT_LIST_DIR}/tls/https_cert.c
@@ -186,6 +193,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/cam
                 ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
                 ${CMAKE_CURRENT_LIST_DIR}/capture
+                ${CMAKE_CURRENT_LIST_DIR}/settings
                 ${CMAKE_CURRENT_LIST_DIR}/tls
                 ${MBEDTLS_DIR}/include
                 ${MBEDTLS_DIR}/library)
@@ -195,7 +203,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
         pico_generate_pio_header(camera_stream_https ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
         target_link_libraries(camera_stream_https PRIVATE
                 pico_stdlib pico_rand hardware_dma hardware_i2c hardware_pio hardware_pwm
-                hardware_gpio hardware_clocks pico_multicore
+                hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash
                 ETHERNET_FILES IOLIBRARY_FILES)
         pico_enable_stdio_usb(camera_stream_https 1)
         pico_enable_stdio_uart(camera_stream_https 0)

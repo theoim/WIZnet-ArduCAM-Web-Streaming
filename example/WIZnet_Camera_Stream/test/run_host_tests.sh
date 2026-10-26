@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host tests for the HTTP request parser, connection table and camera controls. No board, no Pico SDK.
+# Host tests for the HTTP request parser, connection table, camera controls and settings store. No board, no Pico SDK.
 #
 #   example/WIZnet_Camera_Stream/test/run_host_tests.sh
 #
@@ -33,10 +33,13 @@ gcc -std=c99 $TWARN $DEFS -O1 -g \
     -I"$src/http" "$here/conn_test.c" "$out/conn.o" -o "$out/conn_test"
 gcc -std=c99 $WARN $DEFS -O1 -g -c     "$src/cam/cam_ctrl.c" -o "$out/cam_ctrl.o"
 gcc -std=c99 $TWARN $DEFS -O1 -g     -I"$src/cam" "$here/cam_ctrl_test.c" "$out/cam_ctrl.o" -o "$out/cam_ctrl_test"
+gcc -std=c99 $WARN $DEFS -O1 -g -c "$src/settings/settings_store.c" -o "$out/settings_store.o"
+gcc -std=c99 $TWARN $DEFS -O1 -g -I"$src/settings" "$here/settings_store_test.c" "$out/settings_store.o" -o "$out/settings_store_test"
 echo "== host run"
 "$out/http_req_test"
 "$out/conn_test"
 "$out/cam_ctrl_test"
+"$out/settings_store_test"
 
 if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
     echo "== arm cross-compile (size only, not linked)"
@@ -45,7 +48,8 @@ if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
     arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c \
         "$src/http/conn.c" -o "$out/conn.arm.o"
     arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c         "$src/cam/cam_ctrl.c" -o "$out/cam_ctrl.arm.o"
-    arm-none-eabi-size "$out/http_req.arm.o" "$out/conn.arm.o" "$out/cam_ctrl.arm.o"
+    arm-none-eabi-gcc -std=c99 $WARN -Os -mcpu=cortex-m33 -mthumb -c "$src/settings/settings_store.c" -o "$out/settings_store.arm.o"
+    arm-none-eabi-size "$out/http_req.arm.o" "$out/conn.arm.o" "$out/cam_ctrl.arm.o" "$out/settings_store.arm.o"
 else
     echo "== arm-none-eabi-gcc not on PATH, cross-compile skipped"
 fi

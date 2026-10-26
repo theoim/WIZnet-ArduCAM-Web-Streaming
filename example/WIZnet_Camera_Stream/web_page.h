@@ -216,6 +216,8 @@ static const char HTTP_INDEX_PAGE[] =
 ".row input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;\n"
 "  cursor:pointer}\n"
 ".hint.bad{color:var(--stop)}\n"
+".saverow{display:flex;align-items:center;gap:12px;margin-top:12px}\n"
+".saverow .hint{margin:0}\n"
 
 /* ------------------------- Simplified exhibition UI -------------------------
 
@@ -496,6 +498,8 @@ static const char HTTP_INDEX_PAGE[] =
 "    <h2>Sensor controls</h2>\n"
 "    <div id='ctrls' class='ctrls'>loading...</div>\n"
 "    <p id='ctrl-msg' class='hint'></p>\n"
+"    <div class='saverow'><button id='save' class='ghost'>Save as default</button>"
+"<span id='saved' class='hint'></span></div>\n"
 "    <p id='ctrl-note' class='hint' hidden>Shown is the last value set since the camera "
 "started or was reset, not a value read back from it; - means not set since then. "
 "* provisional: safe for capture, but what each step means is not confirmed. "
@@ -796,6 +800,7 @@ static const char HTTP_INDEX_PAGE[] =
 "    $('pll').value=s.pll_div;$('v-pll').textContent=s.pll_div;\n"
 "  }\n"
 "  if(s.ctrl){renderCtrls(s.ctrl)}\n"
+"  savedLine(s);\n"
 
 /* ---- Which of the three states are we in ----
    The device tells us enough to decide without guessing: it reports whether it
@@ -915,6 +920,24 @@ static const char HTTP_INDEX_PAGE[] =
 /* POST, form-encoded. A refusal is shown with the device's own reason and
    the control snaps back to the last value the device reported as written -
    never left showing a value that was not applied. */
+"function savedLine(st){\n"
+"  var x=st&&st.settings;if(!x){return}\n"
+"  $('saved').textContent=x.gen?('Saved: '+x.res+(x.ctrl?', '+x.ctrl:'')+' ('+x.note+')')\n"
+"    :('Nothing saved ('+x.note+')');\n"
+"}\n"
+/* Saving writes flash, so it is a button of its own and never a side effect
+   of moving a control. */
+"$('save').onclick=function(){\n"
+"  var d=deadline(8000);d.opt.method='POST';\n"
+"  ctrlMsg('Saving ...',false);\n"
+"  fetch('/api/settings/save',d.opt).then(function(r){\n"
+"    return r.text().then(function(t){\n"
+"      d.done();var j=null;try{j=JSON.parse(t)}catch(e){}\n"
+"      if(r.ok&&j){ctrlMsg('Saved; used at the next boot',false);render(j);return}\n"
+"      ctrlMsg(r.status+': '+((j&&j.error)?j.error:t),true);\n"
+"    });\n"
+"  }).catch(function(){d.done();ctrlMsg('No reply: may or may not have been saved',true)});\n"
+"};\n"
 "function sendCtrl(name,value){\n"
 "  var d=deadline(5000);\n"
 "  d.opt.method='POST';\n"

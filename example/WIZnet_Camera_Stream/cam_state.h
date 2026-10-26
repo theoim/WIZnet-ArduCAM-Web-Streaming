@@ -25,6 +25,8 @@ bool        cam_state_streaming(void);
 void        cam_state_set_streaming(bool on);
 
 res_t       cam_state_resolution(void);
+/** Boot only, before the first cam_set_framesize(): start at a saved size. */
+void        cam_state_set_boot_resolution(res_t res);
 const char *cam_state_res_string(res_t res);
 bool        cam_state_res_parse(const char *s, size_t len, res_t *out);
 void        cam_state_apply_resolution(res_t res);
@@ -85,7 +87,7 @@ uint32_t    cam_state_sram_total(void);
  * document carries every control's current value so that one poll re-renders
  * the entire panel - the page never has to work out what changed.
  */
-#define CAM_STATUS_JSON_MAX  1280
+#define CAM_STATUS_JSON_MAX  1536
 
 /**
  * Build the status document.

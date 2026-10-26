@@ -13,6 +13,7 @@
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/flash.h"
 #include "pico/critical_section.h"
 
 #include "stream_config.h"
@@ -116,6 +117,9 @@ static void core1_service_command(void)
 
 static void core1_capture_loop(void)
 {
+    /* Lets core 0 park this core in RAM while it erases or programs the
+     * settings sectors (flash_safe_execute, multicore lockout). */
+    flash_safe_execute_core_init();
     while (true) {
         if (g_pause_req) {
             g_paused = true;

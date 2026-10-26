@@ -42,6 +42,7 @@
 #include "cam_state.h"
 #include "cam_driver.h"
 #include "dvp_capture.h"
+#include "settings.h"
 #if STREAM_PIPELINE
 #include "cam_pipeline.h"
 #endif
@@ -76,6 +77,14 @@ int main(void)
     printf("=== camera_stream (" STACK_BUILD_TAG ")  module: %s ===\n", CAM_MODULE_NAME);
     printf("build %s %s  driver %s\n", CAM_BUILD_GIT, CAM_BUILD_UTC, cam_caps.name);
 
+    /* Before core 1 exists: the JEDEC ID read takes the flash out of XIP. */
+    settings_boot();
+
+    res_t saved_res;
+    if (settings_boot_resolution(&saved_res)) {
+        cam_state_set_boot_resolution(saved_res);
+    }
+
     printf("Initializing camera...\n");
     cam_sensor_init();
     cam_capture_init();
@@ -104,22 +113,16 @@ int main(void)
     sleep_ms(200);
 
     /*
-     * The control table is NOT pushed into the sensor at boot.
-     *
-     * Its ranges are provisional, and writing eleven unverified values into a
-     * sensor before it has produced a single frame is a good way to end up with
-     * a camera that answers HTTP and captures nothing. Controls are written
-     * only when someone actually sets one; until then the sensor keeps whatever
-     * its own initialisation gave it.
-     *
-     * The visible cost: the panel shows the table's defaults, not the sensor's
-     * real values, until a control is touched.
+     * No control is written at boot except what an admin saved. A saved value
+     * was set on this sensor and seen working before Save was pressed; anything
+     * else stays at the sensor's own initialisation.
      */
 
     printf("Initial resolution: %s\n",
            cam_state_res_string(cam_state_resolution()));
 
     cam_state_init();
+    settings_apply_controls();          /* before core 1: written directly */
 
 #if EXHIBITION_AUTOSTART
     cam_state_set_streaming(true);
