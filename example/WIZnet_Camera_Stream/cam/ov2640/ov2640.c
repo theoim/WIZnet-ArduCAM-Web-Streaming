@@ -214,22 +214,159 @@ int cam_set_clock_div(uint8_t clk_div, uint8_t pll_div)
  * Recovers from a stalled clock without power-cycling the board.
  */
 /*
- * Image controls: none for now. The exhibition build's control table was
- * dropped when this driver moved to cam/ (its ranges were marked provisional),
- * and the OV2640 board shows intermittent corrupt frames that are being
- * treated as a hardware fault. Controls come back after the new PCB has been
- * verified, so that a picture change can be told apart from that fault.
+ * Image controls.
+ *
+ * Values are the OmniVision OV2640 application-note sequences (the same ones
+ * esp32-camera ships), not measured here. Brightness, contrast, saturation
+ * and the colour effects all live in the DSP's special-digital-effects block,
+ * reached indirectly: 0x7C selects an SDE address, each 0x7D write stores one
+ * byte there and steps to the next address.
+ *
+ *   SDE 0x00  enable bits: 0x04 brightness/contrast, 0x02 saturation,
+ *             0x40 negative, 0x18 fixed U/V (grey and the tints)
+ *   SDE 0x03  U, V saturation           SDE 0x05  fixed U, V for the tints
+ *   SDE 0x07  contrast: 0x07..0x0A      SDE 0x09  brightness: 0x09, 0x0A
+ *
+ * Two things the application note does not settle, so these stay PROVISIONAL:
+ *
+ *   - Contrast writes 0x09 and 0x0A as well, which is where brightness lives.
+ *     The block is rewritten in a fixed order - contrast, then brightness if it
+ *     was set - so a brightness level survives a contrast change; whether the
+ *     result is right when both are moved is for the eye to judge.
+ *   - In the note every sequence writes SDE 0x00 outright, so setting
+ *     saturation would switch brightness off. Here the enable byte is the OR of
+ *     what has been set.
+ *
+ * Level 0 is the note's default, which is not quite the boot table (that
+ * leaves SDE 0x00 at 0 and 0x09/0x0A at 0x10/0x0E).
+ *
+ * White balance auto/manual is DSP 0xC7 bit 6 - read-modify-write, because the
+ * boot table leaves 0xC7 at 0x10. Flip and mirror are sensor-bank REG04 bits:
+ * 0x40|0x10 (vertical flip with the VREF adjust) and 0x80.
+ *
+ * Every frame-size table rewrites the SDE block, 0xC7 and REG04, so the shadow
+ * below is cleared with them (ov2640_ctrl_reset), matching the forget in
+ * cam_state.
  */
+enum { OVC_BRIGHTNESS, OVC_CONTRAST, OVC_SATURATION, OVC_EFFECT, OVC_AWB, OVC_FLIP, OVC_MIRROR };
+
+static const char *const k_effects[] = { "none", "negative", "grayscale", "red", "green", "blue", "sepia" };
+static const char *const k_awb[]     = { "auto", "sunny", "cloudy", "office", "home" };
+
+static const cam_ctrl_desc_t k_ctrls[] = {
+    /* name          label            type           flags                   min max enum       id */
+    { "brightness", "Brightness",    CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -2, 2,  NULL,      OVC_BRIGHTNESS },
+    { "contrast",   "Contrast",      CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -2, 2,  NULL,      OVC_CONTRAST },
+    { "saturation", "Saturation",    CAM_CTRL_INT,  CAM_CTRL_F_PROVISIONAL, -2, 2,  NULL,      OVC_SATURATION },
+    { "effect",     "Effect",        CAM_CTRL_ENUM, CAM_CTRL_F_PROVISIONAL, 0,  6,  k_effects, OVC_EFFECT },
+    { "awb",        "White balance", CAM_CTRL_ENUM, CAM_CTRL_F_PROVISIONAL, 0,  4,  k_awb,     OVC_AWB },
+    { "flip",       "Flip",          CAM_CTRL_BOOL, 0,                      0,  1,  NULL,      OVC_FLIP },
+    { "mirror",     "Mirror",        CAM_CTRL_BOOL, 0,                      0,  1,  NULL,      OVC_MIRROR },
+};
+#define OV_CTRL_COUNT ((unsigned)(sizeof(k_ctrls) / sizeof(k_ctrls[0])))
+
+/* Per level -2..+2 (index level + 2). */
+static const uint8_t k_bright[5]      = { 0x00, 0x10, 0x20, 0x30, 0x40 };            /* SDE 0x09 */
+static const uint8_t k_contrast[5][2] = { {0x18, 0x34}, {0x1c, 0x2a}, {0x20, 0x20},
+                                          {0x24, 0x16}, {0x28, 0x0c} };               /* SDE 0x08, 0x09 */
+static const uint8_t k_sat[5]         = { 0x28, 0x38, 0x48, 0x58, 0x68 };            /* SDE 0x03, 0x04 */
+/* enable bits, fixed U, fixed V */
+static const uint8_t k_effect[7][3]   = { {0x00, 0x80, 0x80}, {0x40, 0x80, 0x80}, {0x18, 0x80, 0x80},
+                                          {0x18, 0x40, 0xc0}, {0x18, 0x40, 0x40}, {0x18, 0xa0, 0x40},
+                                          {0x18, 0x40, 0xa6} };
+static const uint8_t k_wb[5][3]       = { {0, 0, 0}, {0x5e, 0x41, 0x54}, {0x65, 0x41, 0x4f},
+                                          {0x52, 0x41, 0x66}, {0x42, 0x3f, 0x71} };   /* 0xCC..0xCE */
+
+/* What has been set since the last frame-size table; -128 = not set. */
+static int8_t s_lvl[3] = { -128, -128, -128 };   /* brightness, contrast, saturation */
+static int8_t s_effect = -128;
+
+static void ov2640_ctrl_reset(void)
+{
+    s_lvl[0] = s_lvl[1] = s_lvl[2] = -128;
+    s_effect = -128;
+}
+
+static int sde(uint8_t addr, const uint8_t *data, unsigned n)
+{
+    int err = wr(0x7C, addr);
+    for (unsigned i = 0; i < n; i++) {
+        err += wr(0x7D, data[i]);
+    }
+    return err;
+}
+
+/* Rewrite the whole SDE block from the shadow. */
+static int ov2640_write_sde(void)
+{
+    uint8_t en = 0;
+    int err = ov2640_bank(OV2640_BANK_DSP);
+
+    if (s_lvl[0] != -128 || s_lvl[1] != -128) en |= 0x04;
+    if (s_lvl[2] != -128) en |= 0x02;
+    if (s_effect != -128) en |= k_effect[s_effect][0];
+    err += sde(0x00, &en, 1);
+
+    if (s_lvl[2] != -128) {
+        uint8_t uv[2] = { k_sat[s_lvl[2] + 2], k_sat[s_lvl[2] + 2] };
+        err += sde(0x03, uv, 2);
+    }
+    if (s_effect != -128) {
+        err += sde(0x05, &k_effect[s_effect][1], 2);
+    }
+    if (s_lvl[1] != -128) {
+        uint8_t c[4] = { 0x20, k_contrast[s_lvl[1] + 2][0], k_contrast[s_lvl[1] + 2][1], 0x06 };
+        err += sde(0x07, c, 4);
+    }
+    if (s_lvl[0] != -128) {
+        uint8_t b[2] = { k_bright[s_lvl[0] + 2], 0x00 };
+        err += sde(0x09, b, 2);
+    }
+    return err;
+}
+
 const cam_ctrl_desc_t *cam_sensor_controls(unsigned *count)
 {
-    *count = 0;
-    return NULL;
+    *count = OV_CTRL_COUNT;
+    return k_ctrls;
 }
 
 int cam_sensor_set_control(unsigned idx, int16_t value)
 {
-    (void)idx;
-    (void)value;
+    if (idx >= OV_CTRL_COUNT || value < k_ctrls[idx].min || value > k_ctrls[idx].max) {
+        return -1;
+    }
+    switch (k_ctrls[idx].priv) {
+    case OVC_BRIGHTNESS: s_lvl[0] = (int8_t)value; return ov2640_write_sde();
+    case OVC_CONTRAST:   s_lvl[1] = (int8_t)value; return ov2640_write_sde();
+    case OVC_SATURATION: s_lvl[2] = (int8_t)value; return ov2640_write_sde();
+    case OVC_EFFECT:     s_effect = (int8_t)value; return ov2640_write_sde();
+    case OVC_AWB: {
+        int err = ov2640_bank(OV2640_BANK_DSP);
+        uint8_t c7;
+        if (err || sccb_read8(OV2640_SCCB_ADDR, 0xC7, &c7) != 0) {
+            return -1;              /* never write back a value that was not read */
+        }
+        err += wr(0xC7, value ? (uint8_t)(c7 | 0x40) : (uint8_t)(c7 & ~0x40));
+        if (value) {
+            err += wr(0xCC, k_wb[value][0]);
+            err += wr(0xCD, k_wb[value][1]);
+            err += wr(0xCE, k_wb[value][2]);
+        }
+        return err;
+    }
+    case OVC_FLIP:
+    case OVC_MIRROR: {
+        uint8_t bits = (k_ctrls[idx].priv == OVC_FLIP) ? 0x50 : 0x80;
+        int err = ov2640_bank(OV2640_BANK_SENSOR);
+        uint8_t r04;
+        if (err || sccb_read8(OV2640_SCCB_ADDR, 0x04, &r04) != 0) {
+            return -1;
+        }
+        err += wr(0x04, value ? (uint8_t)(r04 | bits) : (uint8_t)(r04 & ~bits));
+        return err;
+    }
+    }
     return -1;
 }
 
@@ -462,6 +599,7 @@ int cam_set_framesize(res_t res)
     }
 
     camera.res = res;
+    ov2640_ctrl_reset();                /* the tables rewrite SDE, 0xC7, REG04 */
 
     /*
      * Only the small tables and our 800x600 one read the SVGA array. The
