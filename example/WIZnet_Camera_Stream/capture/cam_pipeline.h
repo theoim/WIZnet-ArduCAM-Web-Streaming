@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "cam_ctrl.h"
+#include "cam_driver.h"      /* res_t */
 
 /* JPEG up to 1280x720 is 35-37 KB and 800x600 24-28 KB (measured); 96 KB
  * leaves room for busy scenes. 1600x1200 and up (80-100 KB) do not fit and are
@@ -56,6 +57,12 @@ uint32_t cam_pipeline_overwritten(void);  /* completed but never sent        */
 uint32_t cam_pipeline_take_hits(void);    /* core 0 asked and got a frame    */
 uint32_t cam_pipeline_take_misses(void);  /* core 0 asked, nothing new       */
 uint32_t cam_pipeline_leaks(void);        /* SENDING buffers reclaimed       */
+
+/* After a frame-size write: core 1 compares the next frame's JPEG size with
+ * res and writes the size again when the sensor did not take it (a few tries).
+ * Call before cam_pipeline_start() or while core 1 is paused. */
+void     cam_pipeline_verify_res(res_t res);
+uint32_t cam_pipeline_res_rewrites(void); /* size writes repeated since boot */
 
 /* One line describing both buffers and the counters, for the stall log. */
 void cam_pipeline_debug(char *out, unsigned cap);

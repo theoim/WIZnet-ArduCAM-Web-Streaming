@@ -131,6 +131,10 @@ int main(void)
 
 
 #if STREAM_PIPELINE
+    /* The boot size write is the one the LH module was seen to drop: core 1
+     * checks the first frames and writes it again if needed. */
+    cam_pipeline_verify_res(cam_state_resolution());
+
     /* After the sensor is configured and before the network: from here on
      * core 1 owns the camera and core 0 only touches it through
      * cam_pipeline_pause(). */

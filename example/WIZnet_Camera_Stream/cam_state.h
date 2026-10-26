@@ -29,6 +29,7 @@ res_t       cam_state_resolution(void);
 void        cam_state_set_boot_resolution(res_t res);
 const char *cam_state_res_string(res_t res);
 bool        cam_state_res_parse(const char *s, size_t len, res_t *out);
+bool        cam_state_res_dims(res_t res, uint16_t *w, uint16_t *h);
 void        cam_state_apply_resolution(res_t res);
 
 /** Reinitialise a wedged sensor and push the control table back into it. */

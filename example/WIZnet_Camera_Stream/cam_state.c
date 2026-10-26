@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
 
@@ -234,6 +235,19 @@ const char *cam_state_res_string(res_t res)
     }
 }
 
+/** Width and height of a size, from its "WxH" name. */
+bool cam_state_res_dims(res_t res, uint16_t *w, uint16_t *h)
+{
+    const char *s = cam_state_res_string(res);
+    const char *x = strchr(s, 'x');
+    if (!x) {
+        return false;
+    }
+    *w = (uint16_t)atoi(s);
+    *h = (uint16_t)atoi(x + 1);
+    return *w && *h;
+}
+
 /* Smallest first: the status lists the sizes the sensor supports in this order. */
 static const struct { const char *name; res_t res; } k_res_table[] = {
     { "160x120",   RES_160X120   },
@@ -275,6 +289,9 @@ void cam_state_apply_resolution(res_t res)
 #endif
     int set_rc = cam_sensor_supports(res) ? cam_set_framesize(res) : -1;
 #if STREAM_PIPELINE
+    if (set_rc == 0) {
+        cam_pipeline_verify_res(res);   /* check the frames, not the console */
+    }
     cam_pipeline_resume();
 #endif
     if (set_rc != 0) {
@@ -427,7 +444,7 @@ int cam_state_status_json(char *buf, size_t cap)
 {
     int    n;
     size_t used;
-    char   tls_frag[560] = "";
+    char   tls_frag[640] = "";
 #if defined(STREAM_HTTPS)
     tls_status_json(tls_frag, sizeof(tls_frag));
 #endif
@@ -436,13 +453,15 @@ int cam_state_status_json(char *buf, size_t cap)
         size_t k = strlen(tls_frag);
         snprintf(tls_frag + k, sizeof(tls_frag) - k,
                  "\"pipe\":1,\"cap_frames\":%lu,\"cap_over\":%lu,"
-                 "\"take_hit\":%lu,\"take_miss\":%lu,\"pipe_leak\":%lu,\"push_calls\":%lu,",
+                 "\"take_hit\":%lu,\"take_miss\":%lu,\"pipe_leak\":%lu,\"push_calls\":%lu,"
+                 "\"res_rewrites\":%lu,",
                  (unsigned long)cam_pipeline_captured(),
                  (unsigned long)cam_pipeline_overwritten(),
                  (unsigned long)cam_pipeline_take_hits(),
                  (unsigned long)cam_pipeline_take_misses(),
                  (unsigned long)cam_pipeline_leaks(),
-                 (unsigned long)g_push_calls);
+                 (unsigned long)g_push_calls,
+                 (unsigned long)cam_pipeline_res_rewrites());
     }
 #endif
     {

@@ -42,6 +42,20 @@ static volatile bool g_pause_req;
 static volatile bool g_paused;
 static volatile bool g_oneshot_req;            /* one capture while not streaming */
 
+/*
+ * Frame size check. The console and the status report the size we asked for;
+ * only the JPEG says what the sensor did. On the LH module a size write right
+ * after init was dropped: boot with 1600x1200 saved, the status said 1600x1200
+ * and the frames were 1280x720 at 30 fps (2026-10-27). After every size change
+ * core 1 reads the SOF of the next frame and writes the size again while it
+ * does not match, up to RES_VERIFY_TRIES times.
+ */
+#define RES_VERIFY_TRIES 3
+static volatile res_t    g_verify_res;         /* 0 = nothing to check        */
+static volatile uint8_t  g_verify_tries;
+static volatile uint8_t  g_verify_skip;        /* frames to let pass first    */
+static volatile uint32_t g_res_rewrites;
+
 /* ---- control command slot (cam_pipeline.h) ---- */
 typedef enum { CMD_EMPTY = 0, CMD_POSTED, CMD_RUNNING, CMD_DONE } cmd_state_t;
 
@@ -115,6 +129,81 @@ static void core1_service_command(void)
     }
 }
 
+/* Width and height from the JPEG's SOF marker; false when there is none in
+ * the header. The header sits in the first few hundred bytes. */
+static bool jpeg_dims(const uint8_t *p, uint32_t len, uint16_t *w, uint16_t *h)
+{
+    uint32_t i = 2, end = (len < 2048u) ? len : 2048u;
+    while (i + 9 < end) {
+        if (p[i] != 0xFF) {
+            return false;
+        }
+        uint8_t m = p[i + 1];
+        if (m == 0xFF) {                         /* fill byte */
+            i++;
+            continue;
+        }
+        if (m == 0xDA || m == 0xD9) {            /* scan data / end: no SOF seen */
+            return false;
+        }
+        uint32_t seg = ((uint32_t)p[i + 2] << 8) | p[i + 3];
+        if (m >= 0xC0 && m <= 0xC3) {
+            *h = (uint16_t)((p[i + 5] << 8) | p[i + 6]);
+            *w = (uint16_t)((p[i + 7] << 8) | p[i + 8]);
+            return true;
+        }
+        i += 2 + seg;
+    }
+    return false;
+}
+
+/* Core 1, after a good frame: does it have the size asked for? Writes the size
+ * again over SCCB when it does not - core 1 owns the sensor here. */
+static void core1_verify_res(const uint8_t *jpeg, uint32_t len)
+{
+    res_t want = g_verify_res;
+    if (!want) {
+        return;
+    }
+    if (g_verify_skip) {
+        g_verify_skip--;                         /* mode switch still settling */
+        return;
+    }
+    uint16_t w = 0, h = 0, ww = 0, wh = 0;
+    if (!jpeg_dims(jpeg, len, &w, &h) || !cam_state_res_dims(want, &ww, &wh)) {
+        g_verify_res = 0;                        /* nothing to compare: stop  */
+        return;
+    }
+    if (w == ww && h == wh) {
+        if (g_verify_tries) {
+            printf("[res] frames now %ux%u after %u rewrite(s)\n", w, h, g_verify_tries);
+        }
+        g_verify_res = 0;
+        return;
+    }
+    if (g_verify_tries >= RES_VERIFY_TRIES) {
+        printf("[res] frames still %ux%u, not %ux%u, after %u rewrites - giving up\n",
+               w, h, ww, wh, g_verify_tries);
+        g_verify_res = 0;
+        return;
+    }
+    g_verify_tries++;
+    g_res_rewrites++;
+    printf("[res] frames are %ux%u, asked %ux%u - writing the size again (%u/%u)\n",
+           w, h, ww, wh, g_verify_tries, RES_VERIFY_TRIES);
+    cam_set_framesize(want);
+    g_verify_skip = 1;
+}
+
+void cam_pipeline_verify_res(res_t res)
+{
+    g_verify_tries = 0;
+    g_verify_skip  = 1;
+    g_verify_res   = res;
+}
+
+uint32_t cam_pipeline_res_rewrites(void) { return g_res_rewrites; }
+
 static void core1_capture_loop(void)
 {
     /* Lets core 0 park this core in RAM while it erases or programs the
@@ -162,6 +251,9 @@ static void core1_capture_loop(void)
 
         if (ok) {
             cam_state_note_capture_ok();
+            /* Read before core 0 can take it: READY buffers are only ever
+             * read by core 0, never written, so this is safe either way. */
+            core1_verify_res(g_buf[idx], len);
         } else if (rc == -5) {
             cam_state_note_too_big();          /* sensor fine, buffer too small */
         } else if (rc != 0) {
