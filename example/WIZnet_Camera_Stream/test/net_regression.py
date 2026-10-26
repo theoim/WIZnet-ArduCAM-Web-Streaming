@@ -535,7 +535,7 @@ class Stream:
         """Did the server close it within wait s? Frames already buffered are
         read through first; a live stream keeps sending until the deadline.
         Streams in also are drained meanwhile: one left unread fills its TCP
-        window and the server gives it up after its 2 s send timeout."""
+        window and the server gives it up once it takes nothing for 5 s."""
         end = time.monotonic() + wait
         while time.monotonic() < end:
             for o in also:

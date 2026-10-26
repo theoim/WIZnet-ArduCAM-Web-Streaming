@@ -274,6 +274,26 @@ int32_t tls_send_all(uint8_t sn, const uint8_t *buf, uint32_t len)
     return (int32_t)sent;
 }
 
+int32_t tls_send_some(uint8_t sn, const uint8_t *buf, uint32_t len)
+{
+    tls_slot_t *s = &g_slot[sn];
+    if (!s->active || !s->ready) return -1;
+
+    uint32_t sent = 0;
+    while (sent < len) {
+        int rc = mbedtls_ssl_write(&s->ssl, buf + sent, len - sent);
+        if (rc > 0) {
+            sent += (uint32_t)rc;
+            continue;
+        }
+        if (rc == MBEDTLS_ERR_SSL_WANT_WRITE || rc == MBEDTLS_ERR_SSL_WANT_READ) {
+            break;                       /* TX buffer full: the rest next pass */
+        }
+        return -1;
+    }
+    return (int32_t)sent;
+}
+
 int32_t tls_recv(uint8_t sn, uint8_t *buf, uint32_t cap)
 {
     tls_slot_t *s = &g_slot[sn];

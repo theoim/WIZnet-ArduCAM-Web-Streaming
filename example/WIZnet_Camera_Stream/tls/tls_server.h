@@ -9,7 +9,8 @@
  * starving the frame buffer.
  *
  * Everything is non-blocking except tls_send_all(), which spins like the plain
- * tcp_send_all() it replaces: a frame going out holds the loop either way.
+ * tcp_send_all() it replaces. The MJPEG sender uses tls_send_some() instead,
+ * so a viewer that reads slowly no longer holds the loop (2026-10-27).
  */
 
 #ifndef TLS_SERVER_H
@@ -33,6 +34,10 @@ bool    tls_accept(uint8_t sn);              /* false: no free slot - close it  
 int     tls_handshake_step(uint8_t sn);      /* 1 done, 0 in progress, <0 failed */
 
 int32_t tls_send_all(uint8_t sn, const uint8_t *buf, uint32_t len);
+/* As much as the socket takes now, without waiting: bytes accepted (0 = none
+ * yet), <0 failed. After a short count, call again with the rest: mbedTLS may
+ * hold a record half written and needs the same remaining bytes back. */
+int32_t tls_send_some(uint8_t sn, const uint8_t *buf, uint32_t len);
 int32_t tls_recv(uint8_t sn, uint8_t *buf, uint32_t cap);   /* >0, 0 = nothing yet, <0 */
 void    tls_close(uint8_t sn);               /* close_notify if possible, free; idempotent */
 

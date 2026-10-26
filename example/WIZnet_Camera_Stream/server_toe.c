@@ -64,6 +64,12 @@
 
 #define TCP_CHUNK_MAX       1460        /* one segment worth per send() call    */
 #define SEND_TIMEOUT_MS     2000        /* no progress for this long -> drop    */
+#define STREAM_STALL_MS     5000        /* stream frame: no progress -> drop    */
+/* How long one service of the stream socket may wait for TX space. Returning
+ * at the first full buffer left the link idle while the loop went round the
+ * other sockets: 38 ms per 47 KB frame, 26 fps at 1280x720 where the blocking
+ * sender made 30 (2026-10-27). */
+#define STREAM_SPIN_US      2000
 #define HTTP_RX_CHUNK       512         /* bytes read per receive call          */
 #define HTTP_RX_PASSES      4           /* receive calls per socket per pass    */
 
@@ -143,6 +149,41 @@ static uint32_t    g_quick_close;      /* LAST_ACK/TIME_WAIT closed at once */
 static uint32_t        g_stream_frames;
 static absolute_time_t g_stream_opened_at, g_stream_last_sent;
 
+/*
+ * The frame on its way to the stream socket. push_stream_frame() queues what
+ * the socket takes and returns; the next pass carries on from here. A viewer
+ * that reads slowly therefore costs the other sockets nothing - it used to hold
+ * core 0 for up to SEND_TIMEOUT_MS on every frame (2026-10-27). The pipeline
+ * buffer stays SENDING until the last byte is queued. The part head has its own
+ * buffer because g_tx_hdr is shared with every other response.
+ */
+typedef struct {
+    bool            busy;
+    uint8_t         sn;
+    uint8_t         part;           /* 0 part head, 1 JPEG, 2 closing CRLF  */
+    uint32_t        off;            /* bytes of this part already queued    */
+    uint16_t        head_len;
+    char            head[96];
+    const uint8_t  *jpeg;
+    uint32_t        jpeg_len;
+    absolute_time_t started, progress;
+#if STREAM_PIPELINE
+    cam_frame_t     fr;
+#endif
+} stream_tx_t;
+static stream_tx_t g_stx;
+
+static void stream_tx_drop(void)
+{
+    if (!g_stx.busy) {
+        return;
+    }
+#if STREAM_PIPELINE
+    cam_pipeline_release(&g_stx.fr);
+#endif
+    g_stx.busy = false;
+}
+
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
 #if CAM_AUTH
@@ -163,10 +204,10 @@ static uint8_t  sock_idx(uint8_t sn) { return (uint8_t)(sn - SOCK_HTTP_BASE); }
 /**
  * Send the whole buffer, chunked to what the WIZnet TX buffer will take.
  *
- * This spins rather than yielding, so a frame going out is time the other
+ * This spins rather than yielding, so a response going out is time the other
  * sockets are not being polled - including their deadlines, which are checked
- * on the next pass. That is a known limit of Phase 1, not something the HTTP
- * layer can hide.
+ * on the next pass. Fine for pages and JSON; the MJPEG stream uses
+ * tcp_send_some() instead.
  *
  * @return bytes sent, or negative when the peer stalls or disconnects.
  */
@@ -214,6 +255,51 @@ static int32_t tcp_send_all(uint8_t sn, const uint8_t *buf, uint32_t len)
     }
 
     return (int32_t)sent;
+}
+
+/**
+ * Queue as much as the socket takes right now and return without waiting.
+ *
+ * @return bytes queued (0: TX buffer full, or the previous SEND still in
+ *         flight - send() answers SOCK_BUSY), negative when the connection is
+ *         gone. After a short count, call again with the rest.
+ */
+static int32_t tcp_send_some(uint8_t sn, const uint8_t *buf, uint32_t len)
+{
+#if defined(STREAM_HTTPS)
+    return tls_send_some(sn, buf, len);
+#else
+    uint32_t sent = 0;
+
+    while (sent < len) {
+        uint16_t freesize = 0;
+        uint32_t remain;
+        uint16_t chunk;
+        int32_t  ret;
+
+        if (getSn_SR(sn) != SOCK_ESTABLISHED) {
+            return -1;
+        }
+        getsockopt(sn, SO_SENDBUF, &freesize);
+        if (freesize == 0) {
+            break;
+        }
+        remain = len - sent;
+        chunk  = (remain > freesize) ? freesize : (uint16_t)remain;
+        if (chunk > TCP_CHUNK_MAX) {
+            chunk = TCP_CHUNK_MAX;
+        }
+        ret = send(sn, (uint8_t *)(buf + sent), chunk);
+        if (ret < 0) {
+            return ret;
+        }
+        if (ret == 0) {
+            break;
+        }
+        sent += (uint32_t)ret;
+    }
+    return (int32_t)sent;
+#endif
 }
 
 static int32_t send_response_hdrs(uint8_t sn, const char *status,
@@ -330,6 +416,9 @@ static void stream_summary(const char *what, uint8_t sn)
 
 static void release_stream_socket(uint8_t sn)
 {
+    if (g_stx.busy && g_stx.sn == sn) {
+        stream_tx_drop();                 /* frame cut short: buffer back to core 1 */
+    }
     g_role[sock_idx(sn)] = SOCK_ROLE_HTTP;
     if (g_stream_sn == (int8_t)sn) {
         g_stream_sn = -1;
@@ -446,24 +535,19 @@ static int32_t begin_stream(uint8_t sn, const char *why, size_t why_len,
     return 1;
 }
 
-static int32_t push_stream_frame(uint8_t sn)
+/* Next frame into g_stx. 1 = a frame is ready to go, 0 = nothing to send. */
+static int32_t stream_tx_next(uint8_t sn)
 {
-    uint32_t        jpeg_size;
-    int             n;
-    absolute_time_t send_start;
-
     if (!cam_state_streaming()) {
         cam_state_metrics_update();      /* keep the window honest while idle */
-        return 1;
+        return 0;
     }
 
 #if STREAM_PIPELINE
     /* Core 1 captured it already. Nothing new yet means go and serve the
      * other sockets instead of waiting for VSYNC here. */
     static absolute_time_t s_last_sent, s_last_stall_log;
-    g_push_calls++;
-    cam_frame_t fr;
-    if (!cam_pipeline_take(&fr)) {
+    if (!cam_pipeline_take(&g_stx.fr)) {
         cam_state_metrics_update();
         /* Nothing new for 3 s on an open stream: say what the buffers hold,
          * every 5 s, so a freeze explains itself in the console. */
@@ -475,65 +559,122 @@ static int32_t push_stream_frame(uint8_t sn)
                    (unsigned long)g_push_calls);
             s_last_stall_log = get_absolute_time();
         }
-        return 1;
+        return 0;
     }
     s_last_sent = get_absolute_time();
-    const uint8_t *jpeg = fr.data;
-    jpeg_size = fr.len;
+    g_stx.busy     = true;
+    g_stx.jpeg     = g_stx.fr.data;
+    g_stx.jpeg_len = g_stx.fr.len;
 #else
-    const uint8_t *jpeg = image_buff;
     int crc = cam_capture_frame();
     if (crc == -5) {
         cam_state_note_too_big();
-        return 1;
+        return 0;
     }
     if (crc != 0) {
         if (cam_state_note_capture_fail()) {
             printf("No frames for %u attempts - sensor recovered\n",
                    FAIL_STREAK_RECOVER);
         }
-        return 1;
+        return 0;
     }
     cam_state_note_capture_ok();
 
-    jpeg_size = camera.frame_length;
-
     /* A truncated capture would desync the multipart parser - skip it. */
-    if (jpeg_size < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
+    if (camera.frame_length < 2 || image_buff[0] != 0xFF || image_buff[1] != 0xD8) {
         cam_state_note_dropped();
-        return 1;
+        return 0;
     }
+    g_stx.busy     = true;
+    g_stx.jpeg     = image_buff;
+    g_stx.jpeg_len = camera.frame_length;
 #endif
 
-    n = snprintf(g_tx_hdr, sizeof(g_tx_hdr),
-                 "--" MJPEG_BOUNDARY "\r\n"
-                 "Content-Type: image/jpeg\r\n"
-                 "Content-Length: %lu\r\n"
-                 "\r\n",
-                 (unsigned long)jpeg_size);
-    if (n <= 0) {
-#if STREAM_PIPELINE
-        cam_pipeline_release(&fr);
-#endif
+    int n = snprintf(g_stx.head, sizeof(g_stx.head),
+                     "--" MJPEG_BOUNDARY "\r\n"
+                     "Content-Type: image/jpeg\r\n"
+                     "Content-Length: %lu\r\n"
+                     "\r\n",
+                     (unsigned long)g_stx.jpeg_len);
+    if (n <= 0 || n >= (int)sizeof(g_stx.head)) {
+        stream_tx_drop();
         return -1;
     }
+    g_stx.sn       = sn;
+    g_stx.head_len = (uint16_t)n;
+    g_stx.part     = 0;
+    g_stx.off      = 0;
+    g_stx.started  = get_absolute_time();
+    g_stx.progress = g_stx.started;
+    return 1;
+}
 
-    send_start = get_absolute_time();
-
-    int32_t r = tcp_send_all(sn, (const uint8_t *)g_tx_hdr, (uint32_t)n);
-    if (r >= 0) r = tcp_send_all(sn, jpeg, jpeg_size);
-    if (r >= 0) r = tcp_send_all(sn, (const uint8_t *)"\r\n", 2);
+/**
+ * Service the stream socket once: queue what fits of the frame in flight, or
+ * start the next one. Returns without waiting for the client; negative only
+ * when the stream has to end (connection gone, or no progress for
+ * STREAM_STALL_MS - a frozen tab, not a slow one).
+ */
+static int32_t push_stream_frame(uint8_t sn)
+{
 #if STREAM_PIPELINE
-    cam_pipeline_release(&fr);
+    g_push_calls++;
 #endif
-    if (r < 0) {
-        return -1;
+    if (!g_stx.busy) {
+        int32_t r = stream_tx_next(sn);
+        if (r <= 0) {
+            return (r < 0) ? -1 : 1;
+        }
     }
 
+    uint64_t t_enter = time_us_64();
+    while (g_stx.part <= 2) {
+        const uint8_t *p;
+        uint32_t       len;
+        if (g_stx.part == 0) {
+            p = (const uint8_t *)g_stx.head; len = g_stx.head_len;
+        } else if (g_stx.part == 1) {
+            p = g_stx.jpeg;                  len = g_stx.jpeg_len;
+        } else {
+            p = (const uint8_t *)"\r\n";     len = 2;
+        }
+
+        /* The same remaining bytes go back after a short count - mbedTLS
+         * may hold half a record (tls_send_some). */
+        int32_t r = tcp_send_some(sn, p + g_stx.off, len - g_stx.off);
+        if (r < 0) {
+            stream_tx_drop();
+            return -1;
+        }
+        if (r > 0) {
+            g_stx.off     += (uint32_t)r;
+            g_stx.progress = get_absolute_time();
+        }
+        if (g_stx.off < len) {
+            if (time_us_64() - t_enter < STREAM_SPIN_US) {
+                continue;                    /* space usually frees within this */
+            }
+            if (absolute_time_diff_us(g_stx.progress, get_absolute_time()) >
+                (int64_t)STREAM_STALL_MS * 1000) {
+                printf("Stream on socket %u: client took nothing for %u ms - dropped\n",
+                       sn, (unsigned)STREAM_STALL_MS);
+                stream_tx_drop();
+                return -1;
+            }
+            return 1;                        /* the rest on a later pass */
+        }
+        g_stx.part++;
+        g_stx.off = 0;
+    }
+
+    /* Whole frame queued. */
+    uint32_t        jpeg_size = g_stx.jpeg_len;
+    absolute_time_t started   = g_stx.started;
+    stream_tx_drop();
     g_stream_frames++;
     g_stream_last_sent = get_absolute_time();
     cam_state_note_frame(
-        (uint64_t)absolute_time_diff_us(send_start, g_stream_last_sent),
+        (uint64_t)absolute_time_diff_us(started, g_stream_last_sent),
         jpeg_size);
     cam_state_metrics_update();
 
@@ -686,7 +827,11 @@ static int32_t h_snapshot(uint8_t sn, const http_req_t *r)
            (unsigned long)(now_ms() - t0 - waited));
     return rc;
 #else
-    /* Sequential build: capture on this core, into the one buffer. */
+    /* Sequential build: capture on this core, into the one buffer - which a
+     * stream frame may still be going out of. */
+    if (g_stx.busy) {
+        return send_error(sn, 503, "Retry-After: 1\r\n");
+    }
     int cap = cam_capture_frame();
     uint32_t len = camera.frame_length;
     if (cap != 0 || now_ms() - t0 > CAM_SNAPSHOT_TIMEOUT_MS) {
