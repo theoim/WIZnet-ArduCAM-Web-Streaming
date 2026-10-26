@@ -227,28 +227,31 @@ const char *cam_state_res_string(res_t res)
     }
 }
 
+/* Smallest first: the status lists the sizes the sensor supports in this order. */
+static const struct { const char *name; res_t res; } k_res_table[] = {
+    { "160x120",   RES_160X120   },
+    { "176x144",   RES_176X144   },
+    { "320x240",   RES_320X240   },
+    { "352x288",   RES_352X288   },
+    { "640x480",   RES_640X480   },
+    { "800x600",   RES_800X600   },
+    { "1024x768",  RES_1024X768  },
+    { "1280x720",  RES_1280X720  },
+    { "1280x1024", RES_1280X1024 },
+    { "1600x1200", RES_1600X1200 },
+    { "1920x1080", RES_1920X1080 },
+};
+#define RES_TABLE_COUNT (sizeof(k_res_table) / sizeof(k_res_table[0]))
+
 /** Match a token that is not NUL-terminated - it is a slice of a URL. */
 bool cam_state_res_parse(const char *s, size_t len, res_t *out)
 {
-    static const struct { const char *name; res_t res; } table[] = {
-        { "160x120",   RES_160X120   },
-        { "176x144",   RES_176X144   },
-        { "320x240",   RES_320X240   },
-        { "352x288",   RES_352X288   },
-        { "640x480",   RES_640X480   },
-        { "800x600",   RES_800X600   },
-        { "1024x768",  RES_1024X768  },
-        { "1280x720",  RES_1280X720  },
-        { "1280x1024", RES_1280X1024 },
-        { "1600x1200", RES_1600X1200 },
-        { "1920x1080", RES_1920X1080 },
-    };
     size_t i;
 
-    for (i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
-        size_t n = strlen(table[i].name);
-        if (n == len && memcmp(s, table[i].name, n) == 0) {
-            *out = table[i].res;
+    for (i = 0; i < RES_TABLE_COUNT; i++) {
+        size_t n = strlen(k_res_table[i].name);
+        if (n == len && memcmp(s, k_res_table[i].name, n) == 0) {
+            *out = k_res_table[i].res;
             return true;
         }
     }
@@ -474,13 +477,60 @@ int cam_state_status_json(char *buf, size_t cap)
     }
     used = (size_t)n;
 
-    n = 0;   /* no sensor control table in this build */
-    if (n < 0) {
+    /*
+     * ctrl: the last value written to each control since the sensor was last
+     * reset or resized. Not read back from the sensor; a control nobody set
+     * since then is absent rather than shown as a default.
+     */
+    {
+        unsigned cnt = 0;
+        const cam_ctrl_desc_t *t = cam_sensor_controls(&cnt);
+        bool first = true;
+        for (unsigned i = 0; t && i < cnt; i++) {
+            int16_t v;
+            if (!cam_pipeline_control_written(i, &v)) {
+                continue;
+            }
+            n = snprintf(buf + used, cap - used, "%s\"%s\":%d", first ? "" : ",",
+                         t[i].name, v);
+            if (n < 0 || (size_t)n >= cap - used) {
+                return -1;
+            }
+            used += (size_t)n;
+            first = false;
+        }
+    }
+    n = snprintf(buf + used, cap - used, "},\"ctrl_applied\":%lu,\"ctrl_timeouts\":%lu",
+                 (unsigned long)cam_pipeline_cmd_applied(),
+                 (unsigned long)cam_pipeline_cmd_timeouts());
+    if (n < 0 || (size_t)n >= cap - used) {
         return -1;
     }
     used += (size_t)n;
 
-    n = snprintf(buf + used, cap - used, "}}");
+    /* res_list: the sizes this sensor accepts, so the page offers only those. */
+    {
+        bool first = true;
+        n = snprintf(buf + used, cap - used, ",\"res_list\":[");
+        if (n < 0 || (size_t)n >= cap - used) {
+            return -1;
+        }
+        used += (size_t)n;
+        for (size_t i = 0; i < RES_TABLE_COUNT; i++) {
+            if (!cam_sensor_supports(k_res_table[i].res)) {
+                continue;
+            }
+            n = snprintf(buf + used, cap - used, "%s\"%s\"", first ? "" : ",",
+                         k_res_table[i].name);
+            if (n < 0 || (size_t)n >= cap - used) {
+                return -1;
+            }
+            used += (size_t)n;
+            first = false;
+        }
+    }
+
+    n = snprintf(buf + used, cap - used, "]}");
     if (n < 0 || (size_t)n >= cap - used) {
         return -1;
     }

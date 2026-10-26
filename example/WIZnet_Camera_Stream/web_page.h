@@ -79,6 +79,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  letter-spacing:3px;min-width:200px;text-align:center}\n"
 "header .what{color:var(--muted);font-size:13px;max-width:210px;\n"
 "  line-height:1.4;text-align:right}\n"
+".rate{display:none}\n"
 
 /* --- The state banner. The whole point of this page having three states
        instead of two, so it gets a full-width strip rather than a word in a
@@ -214,6 +215,7 @@ static const char HTTP_INDEX_PAGE[] =
 ".row input[type=range]{margin:0}\n"
 ".row input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;\n"
 "  cursor:pointer}\n"
+".hint.bad{color:var(--stop)}\n"
 
 /* ------------------------- Simplified exhibition UI -------------------------
 
@@ -251,9 +253,11 @@ static const char HTTP_INDEX_PAGE[] =
 /* Logo over badge, both centred. A visitor reads top to bottom from a few
    metres away and the badge is what they are meant to come away with, so it
    sits directly under the logo with nothing competing beside it. */
-"header{flex-direction:column;align-items:center;gap:6px;\n"
-"  padding:10px 16px 12px}\n"
-"header .logo{height:38px}\n"
+/* No longer a booth exhibit, so no stack badge and no graphs: logo on the
+   left, frame rate and bandwidth as plain numbers on the right. */
+"header{padding:8px 16px;border-bottom-width:2px}\n"
+"header .logo{height:34px}\n"
+"header .stackbox,#sec-perf{display:none}\n"
 "header .stackbox{margin-left:0;flex-direction:column;align-items:center;\n"
 "  gap:3px}\n"
 "header .tag{order:1;font-size:40px;padding:4px 32px;letter-spacing:2px;\n"
@@ -284,19 +288,27 @@ static const char HTTP_INDEX_PAGE[] =
 
    What is left on screen is the exhibit itself: two boards, the same picture,
    one number each. 17 against 8. */
-"#sec-ctl,#sec-sweep,#sec-ctrls,#sec-res,footer{display:none}\n"
+"#sec-ctl,#sec-sweep,#sec-ctrls,footer{display:none}\n"
+"body.show-ctrls #sec-ctrls{display:block}\n"
 
 /* Three rows now: picture takes the slack, bar and graphs take what they
    need. The bar is a bare strip, not a card - it reads as part of the
    picture frame rather than as another panel. */
 "#sec-res{padding:0;border:0;background:transparent;box-shadow:none}\n"
-".resseg button{font-size:17px;padding:12px 0}\n"
+".resbar{display:flex;align-items:center;justify-content:center;gap:10px}\n"
+".resbar label{margin:0;font-size:13px}\n"
+".resbar select{width:auto;min-width:200px;font-size:15px}\n"
 
 /* Mirrors the STREAMING pill on the other corner, one size up because it is
    the only thing on the page that answers "what am I looking at". */
-".resnow{display:block;position:absolute;top:8px;right:10px;z-index:2;\n"
-"  padding:6px 20px;border-radius:999px;background:var(--stack);\n"
-"  color:#ffffff;font-size:26px;font-weight:800;letter-spacing:2px}\n"
+"#sec-view .ovr{position:absolute;top:8px;right:10px;z-index:2;display:flex;\n"
+"  align-items:center;gap:8px}\n"
+".resnow{display:block;padding:5px 16px;border-radius:999px;\n"
+"  background:var(--stack);color:#ffffff;font-size:21px;font-weight:800;\n"
+"  letter-spacing:1.6px}\n"
+"#sec-view .rate{display:flex;gap:14px;padding:6px 14px;border-radius:8px;\n"
+"  background:rgba(0,0,0,.75);color:#ffffff;font-size:13px}\n"
+"#sec-view .rate b{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}\n"
 /* The picture is its own frame: no card padding, no border, black to the
    edge. STREAMING becomes a pill over the top-left corner instead of a line
    above the picture, which is ~30px of height back for the graphs. */
@@ -360,7 +372,12 @@ static const char HTTP_INDEX_PAGE[] =
 /* Which mode is running, over the top-right of the picture, mirroring the
    STREAMING pill on the left. Its text comes from the device reply, not from
    the click, so it shows what the camera actually did. */
-"    <div class='resnow' id='resnow'>-</div>\n"
+/* Frame rate and what the stream puts on the link, beside it. Only painted in
+   the simplified layout, where the graphs are gone. */
+"    <div class='ovr'>"
+"<div class='rate'><span><b id='h-fps'>-</b> fps</span>"
+"<span><b id='h-bw'>-</b> Mbps</span></div>"
+"<div class='resnow' id='resnow'>-</div></div>\n"
 /* No src here on purpose. With one, the browser opens the stream while this
    page is still being transferred, so the two compete for the same send path -
    and if the device is not streaming yet, that connection sits there holding a
@@ -410,33 +427,8 @@ static const char HTTP_INDEX_PAGE[] =
    The data-res values are the same strings /api/res takes and the same ones
    the select carries, so nothing has to translate between them. */
 "  <section class='card wide' id='sec-res'>\n"
-"    <div class='resseg' id='resseg'>\n"
-/* SVGA and UXGA.
-
-   These were HD and FHD, which the OV2640 does not have. Neither size exists
-   in the sensor, /api/res rejected both, and the two buttons on the show build
-   did nothing at all when pressed.
-
-   The pair that replaces them is a better exhibit than the one it replaces,
-   because these two modes differ in both of the ways that matter, at once:
-
-     800x600    the SVGA array. The sensor reads 800x600 and sends it. ~22 KB
-     1600x1200  the UXGA array. Four times the pixels off the sensor, four
-                times the frame on the wire, a quarter of the frame rate
-
-   So the fast button is not merely "smaller" - the sensor is doing a quarter
-   of the work - and the slow one puts four times the data on the link. That
-   second half is what separates the stacks: a hardwired stack hands the frame
-   over and moves on, while a software stack holds the capture buffer until the
-   far end acknowledges it, and the bigger the frame the longer that is.
-
-   The pixel count rides along in the label because the two together answer
-   both questions at once - what it is called, and how much more data it is.
-   The badge over the picture stays short; there is no room for a bracket
-   there and it is read from further away. */
-"      <button data-res='800x600'>SVGA <small>(800&times;600)</small></button>\n"
-"      <button data-res='1600x1200'>UXGA <small>(1600&times;1200)</small></button>\n"
-"    </div>\n"
+"    <div class='resbar'><label for='resbar'>Resolution</label>"
+"<select id='resbar'></select></div>\n"
 "  </section>\n"
 "  <section class='card wide' id='sec-perf'>\n"
 "    <h2>Live performance</h2>\n"
@@ -503,6 +495,11 @@ static const char HTTP_INDEX_PAGE[] =
 "  <section class='card wide' id='sec-ctrls'>\n"
 "    <h2>Sensor controls</h2>\n"
 "    <div id='ctrls' class='ctrls'>loading...</div>\n"
+"    <p id='ctrl-msg' class='hint'></p>\n"
+"    <p id='ctrl-note' class='hint' hidden>Shown is the last value set since the camera "
+"started or was reset, not a value read back from it; - means not set since then. "
+"* provisional: safe for capture, but what each step means is not confirmed. "
+"The camera module may keep its settings across a power cycle.</p>\n"
 "  </section>\n"
 "</main>\n"
 "<footer>Served from the device</footer>\n"
@@ -512,7 +509,22 @@ static const char HTTP_INDEX_PAGE[] =
    reads. The keys are exactly the strings /api/status returns, so an unknown
    value falls through to the raw string rather than showing nothing. */
 "var RESNAME={'320x240':'QVGA','640x480':'VGA','800x600':'SVGA',\n"
-"  '1024x768':'XGA','1280x1024':'SXGA','1600x1200':'UXGA'};\n"
+"  '1024x768':'XGA','1280x720':'HD','1280x1024':'SXGA','1600x1200':'UXGA',\n"
+"  '1920x1080':'FHD'};\n"
+/* Both selects offer only what the sensor accepts: the device lists its sizes
+   in res_list. Rebuilt only when the list changes, so an open drop-down is
+   not torn down by the next poll. */
+"var resKey='';\n"
+"function fillRes(list){\n"
+"  var k=list.join(',');if(k===resKey){return}resKey=k;\n"
+"  ['res','resbar'].forEach(function(id){\n"
+"    var el=$(id);el.innerHTML='';\n"
+"    list.forEach(function(r){\n"
+"      var o=document.createElement('option');o.value=r;\n"
+"      o.textContent=(RESNAME[r]?RESNAME[r]+' ':'')+r.replace('x',' x ');\n"
+"      el.appendChild(o)});\n"
+"  });\n"
+"}\n"
 "$('addr').textContent=location.host;\n"
 "var css=getComputedStyle(document.documentElement);\n"
 "var C=function(n){return css.getPropertyValue(n).trim()};\n"
@@ -596,7 +608,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  charts.forEach(function(c){\n"
 "    c.shown+=(c.target-c.shown)*0.12;\n"
 "    if(c.hist.length){c.hist[c.hist.length-1]=c.shown}\n"
-"    draw(c);\n"
+"    if(c.cv.offsetParent){draw(c)}\n"
 "  });\n"
 "  $('s-fps').textContent=chF.shown.toFixed(1);\n"
 "  $('s-bw').textContent=chB.shown.toFixed(1);\n"
@@ -622,7 +634,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  $('dot').className='dot gone';\n"
 "  $('s-state').textContent='NO REPLY';\n"
 "  banner('gone','No reply from <b>'+location.host+'</b> &mdash; '\n"
-"    +'the numbers below are the last ones it reported.');\n"
+"    +'the numbers shown are the last ones it reported.');\n"
 "}\n"
 
 /* ---- Every request gets a deadline ----
@@ -704,7 +716,9 @@ static const char HTTP_INDEX_PAGE[] =
 "  $('s-drop').textContent=s.dropped;\n"
 "  $('start').disabled=s.streaming;\n"
 "  $('stop').disabled=!s.streaming;\n"
+"  if(s.res_list){fillRes(s.res_list)}\n"
 "  if($('res').value!==s.res){$('res').value=s.res}\n"
+"  if(document.activeElement!==$('resbar')&&$('resbar').value!==s.res){$('resbar').value=s.res}\n"
 /* Clear the traces on any resolution change, including one this page did
    not ask for.
 
@@ -724,8 +738,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  }\n"
 "  lastRes=s.res;\n"
 "  $('resnow').textContent=RESNAME[s.res]||s.res;\n"
-"  Array.prototype.forEach.call($('resseg').children,function(b){\n"
-"    b.className=(b.getAttribute('data-res')===s.res)?'on':''});\n"
+
 "  $('s-kb').textContent=s.kb;\n"
 "  $('s-vsync').textContent=s.vsync_ms;\n"
 "  $('s-read').textContent=s.read_ms;\n"
@@ -745,6 +758,8 @@ static const char HTTP_INDEX_PAGE[] =
    line fall while the load runs beside it, and summing them would hide exactly
    that. */
 "  push(chB,s.fps*s.kb*8/1000);\n"
+"  $('h-fps').textContent=s.fps.toFixed(1);\n"
+"  $('h-bw').textContent=(s.fps*s.kb*8/1000).toFixed(1);\n"
 "  var mn=1e9,mx=0,sum=0,bmx=0,i,v;\n"
 "  for(i=0;i<chF.hist.length;i++){v=chF.hist[i];\n"
 "    if(v<mn){mn=v}if(v>mx){mx=v}sum+=v}\n"
@@ -757,7 +772,7 @@ static const char HTTP_INDEX_PAGE[] =
 "  }\n"
 "  $('s-hint').innerHTML=hint(s);\n"
 "  if(s.stack){\n"
-"    var toe=(s.stack==='TOE');\n"
+"    var toe=(s.stack.indexOf('TOE')===0);\n"
 /* The badge is the one thing a visitor is meant to read from across the
    room, so it carries the brand on the TOE side: "TOE" alone means
    nothing to someone who has not been told what it stands for, and the
@@ -854,57 +869,89 @@ static const char HTTP_INDEX_PAGE[] =
    The device owns the list: names, labels, groups and ranges all arrive from
    /api/controls, so a control added in cam_controls.c appears here on its own.
    A range of 0..1 is a checkbox and anything wider is a slider. */
-"var ctrlEls={};\n"
+"var ctrlEls={},lastCtrl={};\n"
 "function buildCtrls(list){\n"
-"  var box=$('ctrls'),groups={},order=[];\n"
-/* An empty list is a build with EXHIBITION_SENSOR_CONTROLS off, not a
-   failure. Say which it is, or the panel just looks broken. */
-"  if(!list.length){box.textContent='Sensor controls are disabled in this build.';return}\n"
-"  list.forEach(function(c){\n"
-"    if(!groups[c.group]){groups[c.group]=[];order.push(c.group)}\n"
-"    groups[c.group].push(c);\n"
-"  });\n"
+"  var box=$('ctrls');\n"
+/* An empty list is a driver that offers no controls (OV2640 until its new
+   board is verified), not a failure. Say which it is. */
+"  if(!list.length){box.textContent='This camera offers no controls in this build.';return}\n"
 "  box.innerHTML='';\n"
-"  order.forEach(function(g){\n"
-"    var d=document.createElement('div');d.className='grp';\n"
-"    var h=document.createElement('h3');h.textContent=g;d.appendChild(h);\n"
-"    groups[g].forEach(function(c){d.appendChild(ctrlRow(c))});\n"
-"    box.appendChild(d);\n"
-"  });\n"
+"  var d=document.createElement('div');d.className='grp';\n"
+"  list.forEach(function(c){d.appendChild(ctrlRow(c))});\n"
+"  box.appendChild(d);\n"
+"  $('ctrl-note').hidden=false;\n"
+"  renderCtrls(lastCtrl,true);\n"
 "}\n"
+/* enum -> select, bool -> checkbox, int -> slider. Nothing is pre-filled with a
+   guessed default: until a value has been set, the device has not said what
+   the sensor holds, so the control shows '-' (indeterminate for a checkbox). */
 "function ctrlRow(c){\n"
 "  var row=document.createElement('div');row.className='row';\n"
 "  var nm=document.createElement('span');nm.className='nm';\n"
-"  nm.textContent=c.label;row.appendChild(nm);\n"
-"  var toggle=(c.min===0&&c.max===1);\n"
-"  var el=document.createElement('input');\n"
-"  el.type=toggle?'checkbox':'range';\n"
-"  if(!toggle){el.min=c.min;el.max=c.max}\n"
-"  row.appendChild(el);\n"
-"  var vl=null;\n"
-"  if(!toggle){\n"
-"    vl=document.createElement('span');vl.className='vl';row.appendChild(vl);\n"
+"  nm.textContent=c.label+(c.provisional?' *':'');row.appendChild(nm);\n"
+"  var el,vl=document.createElement('span');vl.className='vl';vl.textContent='-';\n"
+"  if(c.type==='enum'){\n"
+"    el=document.createElement('select');\n"
+"    var o=document.createElement('option');o.value='';o.textContent='-';el.appendChild(o);\n"
+"    (c.options||[]).forEach(function(t,i){\n"
+"      var p=document.createElement('option');p.value=String(i);p.textContent=t;el.appendChild(p)});\n"
+"    el.onchange=function(){if(el.value!==''){sendCtrl(c.name,el.value)}};\n"
+"  }else if(c.type==='bool'){\n"
+"    el=document.createElement('input');el.type='checkbox';el.indeterminate=true;\n"
+"    el.onchange=function(){sendCtrl(c.name,el.checked?1:0)};\n"
+"  }else{\n"
+"    el=document.createElement('input');el.type='range';el.min=c.min;el.max=c.max;\n"
+"    el.value=(c.min<=0&&c.max>=0)?0:c.min;\n"
 /* Follow the thumb live for the label, but only send on release: a drag across
    the range would otherwise fire one request per notch. */
 "    el.oninput=function(){vl.textContent=el.value};\n"
 "    el.onchange=function(){sendCtrl(c.name,el.value)};\n"
-"  }else{\n"
-"    el.onchange=function(){sendCtrl(c.name,el.checked?1:0)};\n"
 "  }\n"
-"  ctrlEls[c.name]={el:el,vl:vl,toggle:toggle};\n"
+"  row.appendChild(el);row.appendChild(vl);\n"
+"  ctrlEls[c.name]={el:el,vl:vl,c:c};\n"
 "  return row;\n"
 "}\n"
-"function sendCtrl(name,value){call('/api/cam?'+name+'='+value).catch(offline)}\n"
-"function renderCtrls(values){\n"
-"  for(var k in values){\n"
-"    var e=ctrlEls[k];\n"
+"function ctrlMsg(t,bad){var m=$('ctrl-msg');m.textContent=t;m.className=bad?'hint bad':'hint'}\n"
+/* POST, form-encoded. A refusal is shown with the device's own reason and
+   the control snaps back to the last value the device reported as written -
+   never left showing a value that was not applied. */
+"function sendCtrl(name,value){\n"
+"  var d=deadline(5000);\n"
+"  d.opt.method='POST';\n"
+"  d.opt.headers={'Content-Type':'application/x-www-form-urlencoded'};\n"
+"  d.opt.body=encodeURIComponent(name)+'='+encodeURIComponent(value);\n"
+"  ctrlMsg('Setting '+name+' ...',false);\n"
+"  fetch('/api/cam',d.opt).then(function(r){\n"
+"    return r.text().then(function(t){\n"
+"      d.done();\n"
+"      var j=null;try{j=JSON.parse(t)}catch(e){}\n"
+"      if(r.ok&&j){ctrlMsg(name+' = '+value+' written',false);render(j);return}\n"
+"      ctrlMsg(r.status+': '+((j&&j.error)?j.error:t)+((j&&j.control)?' ('+j.control+')':''),true);\n"
+"      renderCtrls(lastCtrl,true);\n"
+"    });\n"
+"  }).catch(function(){\n"
+"    d.done();\n"
+"    ctrlMsg('No reply: the change may or may not have been applied',true);\n"
+"    renderCtrls(lastCtrl,true);\n"
+"  });\n"
+"}\n"
+"function renderCtrls(values,force){\n"
+"  lastCtrl=values||{};\n"
+"  for(var k in ctrlEls){\n"
+"    var e=ctrlEls[k],has=Object.prototype.hasOwnProperty.call(lastCtrl,k),v=lastCtrl[k];\n"
 /* Leave whatever the user is touching alone; the poll would otherwise snap the
    thumb back mid-drag. */
-"    if(!e||document.activeElement===e.el){continue}\n"
-"    if(e.toggle){e.el.checked=!!values[k]}\n"
-"    else{e.el.value=values[k];if(e.vl){e.vl.textContent=values[k]}}\n"
+"    if(!force&&document.activeElement===e.el){continue}\n"
+"    e.vl.textContent=has?String(v):'-';\n"
+"    if(e.c.type==='bool'){e.el.indeterminate=!has;e.el.checked=has&&!!v}\n"
+"    else if(e.c.type==='enum'){e.el.value=has?String(v):''}\n"
+"    else{e.el.value=has?v:((e.c.min<=0&&e.c.max>=0)?0:e.c.min)}\n"
 "  }\n"
 "}\n"
+/* The simplified exhibition layout hides this panel; #controls in the address
+   brings it back without a different build. */
+"function ctrlHash(){document.body.classList.toggle('show-ctrls',location.hash==='#controls')}\n"
+"ctrlHash();window.addEventListener('hashchange',ctrlHash);\n"
 "fetch('/api/controls').then(function(r){return r.json()}).then(buildCtrls)\n"
 "  .catch(function(){$('ctrls').textContent='controls unavailable'});\n"
 
@@ -1125,9 +1172,7 @@ static const char HTTP_INDEX_PAGE[] =
 "    .catch(offline);\n"
 "}\n"
 "$('res').onchange=function(){applyRes(this.value)};\n"
-"Array.prototype.forEach.call($('resseg').children,function(b){\n"
-"  b.onclick=function(){applyRes(b.getAttribute('data-res'))};\n"
-"});\n"
+"$('resbar').onchange=function(){applyRes(this.value)};\n"
 "$('clk').oninput=function(){$('v-clk').textContent=this.value};\n"
 "$('pll').oninput=function(){$('v-pll').textContent=this.value};\n"
 "function applyClk(c,p){\n"

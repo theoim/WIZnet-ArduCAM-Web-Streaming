@@ -18,6 +18,7 @@ const char *cam_ctrl_err_name(cam_ctrl_err_t e)
     case CAM_CTRL_E_RANGE:    return "out of range";
     case CAM_CTRL_E_DUP:      return "control given twice";
     case CAM_CTRL_E_TOO_MANY: return "too many controls in one request";
+    case CAM_CTRL_E_EMPTY:    return "no control given";
     }
     return "?";
 }
@@ -127,6 +128,92 @@ cam_ctrl_err_t cam_ctrl_batch_add(cam_ctrl_batch_t *b, const cam_ctrl_desc_t *t,
     b->item[b->n].value = v;
     b->n++;
     return CAM_CTRL_OK;
+}
+
+static int hexval(uint8_t c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode [s, e) into out (NUL-terminated). false on a bad escape or when it
+ * does not fit. */
+static bool form_decode(const uint8_t *s, const uint8_t *e, char *out, size_t cap)
+{
+    size_t o = 0;
+    while (s < e) {
+        uint8_t c = *s++;
+        if (c == '%') {
+            if (e - s < 2) return false;
+            int h = hexval(s[0]), l = hexval(s[1]);
+            if (h < 0 || l < 0) return false;
+            c = (uint8_t)((h << 4) | l);
+            s += 2;
+        } else if (c == '+') {
+            c = ' ';
+        }
+        if (o + 1 >= cap) return false;
+        out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return true;
+}
+
+static void copy_name(char *dst, size_t cap, const uint8_t *s, const uint8_t *e)
+{
+    if (!dst || cap == 0) return;
+    size_t i = 0;
+    while (s < e && i + 1 < cap) {
+        dst[i++] = (char)*s++;
+    }
+    dst[i] = 0;
+}
+
+cam_ctrl_err_t cam_ctrl_parse_form(const uint8_t *body, size_t len,
+                                   const cam_ctrl_desc_t *t, unsigned n,
+                                   cam_ctrl_batch_t *b, char *bad_name, size_t bad_cap)
+{
+    const uint8_t *p = body, *end = body + len;
+
+    cam_ctrl_batch_init(b);
+    if (bad_name && bad_cap) bad_name[0] = 0;
+    if (!body || len == 0) {
+        return CAM_CTRL_E_EMPTY;
+    }
+
+    while (p <= end) {
+        const uint8_t *pe = p;
+        while (pe < end && *pe != '&') pe++;
+        const uint8_t *eq = p;
+        while (eq < pe && *eq != '=') eq++;
+
+        char name[CAM_CTRL_NAME_MAX + 1];
+        char val[16];
+        if (pe == p || eq == pe) {                   /* "" or "name" */
+            copy_name(bad_name, bad_cap, p, pe);
+            return CAM_CTRL_E_SYNTAX;
+        }
+        if (!form_decode(p, eq, name, sizeof(name))) {
+            copy_name(bad_name, bad_cap, p, eq);
+            return CAM_CTRL_E_UNKNOWN;               /* too long or bad escape */
+        }
+        if (!form_decode(eq + 1, pe, val, sizeof(val))) {
+            copy_name(bad_name, bad_cap, (const uint8_t *)name,
+                      (const uint8_t *)name + strlen(name));
+            return CAM_CTRL_E_SYNTAX;
+        }
+        cam_ctrl_err_t e = cam_ctrl_batch_add(b, t, n, name, strlen(name), val, strlen(val));
+        if (e != CAM_CTRL_OK) {
+            copy_name(bad_name, bad_cap, (const uint8_t *)name,
+                      (const uint8_t *)name + strlen(name));
+            return e;
+        }
+        if (pe == end) break;
+        p = pe + 1;
+    }
+    return b->n ? CAM_CTRL_OK : CAM_CTRL_E_EMPTY;
 }
 
 void cam_ctrl_run(const cam_ctrl_batch_t *b, cam_ctrl_setter_t set, cam_ctrl_result_t *res)

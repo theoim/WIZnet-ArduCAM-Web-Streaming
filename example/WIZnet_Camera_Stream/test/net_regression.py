@@ -150,7 +150,7 @@ def t_routes(b):
     print("routes")
     for path, want, ctype in [("/", 200, "text/html"), ("/index.html", 200, "text/html"),
                               ("/logo.png", 200, "image/png"), ("/api/status", 200, "application/json"),
-                              ("/api/controls", 200, "application/json"), ("/api/cam?brightness=1", 200, None),
+                              ("/api/controls", 200, "application/json"), ("/api/cam?brightness=1", 405, None),
                               ("/load?kb=1", 200, None), ("/load", 200, None),
                               ("/nope", 404, None), ("/api/status/x", 404, None)]:
         st, hdr, body = parse(b.get(path))
@@ -161,9 +161,72 @@ def t_routes(b):
     st, _, _ = parse(b.roundtrip(b"DELETE / HTTP/1.1\r\nHost: x\r\n\r\n"))
     check("DELETE / -> 405", st == 405, f"got {st}")
     st, _, body = parse(b.get("/api/controls"))
-    check("/api/controls still []", body == b"[]", repr(body[:20]))
+    try:
+        ok = isinstance(json.loads(body), list)
+    except ValueError:
+        ok = False
+    check("/api/controls is a JSON list", ok, repr(body[:40]))
     s = b.status()
     check("/api/status has http counters", bool(s) and "http" in s, "")
+
+
+def post_form(b, body, ctype=b"application/x-www-form-urlencoded"):
+    head = b"POST /api/cam HTTP/1.1\r\nHost: x\r\n"
+    if ctype:
+        head += b"Content-Type: " + ctype + b"\r\n"
+    head += b"Content-Length: %d\r\n\r\n" % len(body)
+    return parse(b.roundtrip(head + body))
+
+
+def t_controls(b):
+    """Phase 2c. Only value 0 is ever written: on the LH module that is the
+    value every tested register already holds, and the module keeps settings
+    across power cycles, so the test must not leave anything else behind."""
+    print("controls (2c)")
+    st, hdr, _ = parse(b.get("/api/cam"))
+    check("GET /api/cam -> 405 + Allow: POST", st == 405 and hdr.get("allow") == "POST",
+          f"got {st} {hdr.get('allow')}")
+    st, _, body = parse(b.get("/api/controls"))
+    ctrls = {c["name"]: c for c in json.loads(body)}
+    print(f"  driver offers: {', '.join(ctrls) or 'none'}")
+    st, _, _ = post_form(b, b"brightness=0", ctype=b"text/plain")
+    check("text/plain -> 415", st == 415, f"got {st}")
+    st, _, _ = post_form(b, b"brightness=0", ctype=None)
+    check("no Content-Type -> 415", st == 415, f"got {st}")
+    st, _, body = post_form(b, b"")
+    check("empty body -> 400", st == 400 and b"no control" in body, f"got {st} {body[:60]!r}")
+    st, _, body = post_form(b, b"zoom=1")
+    check("unknown control -> 400 names it", st == 400 and b'"control":"zoom"' in body,
+          f"got {st} {body[:80]!r}")
+    if "brightness" not in ctrls:
+        print("  (no brightness control: write checks skipped)")
+        return
+    hi = ctrls["brightness"]["max"] + 1
+    before = b.status().get("ctrl_applied")
+    st, _, body = post_form(b, b"brightness=%d" % hi)
+    check(f"brightness={hi} -> 400 out of range, not clamped", st == 400 and b"out of range" in body,
+          f"got {st} {body[:80]!r}")
+    st, _, body = post_form(b, b"brightness=0&zoom=1")
+    check("one bad pair -> 400, nothing written",
+          st == 400 and b.status().get("ctrl_applied") == before, f"got {st}")
+    st, _, body = post_form(b, b"brightness=0&brightness=0")
+    check("duplicate -> 400", st == 400 and b"twice" in body, f"got {st}")
+    st, _, body = post_form(b, b"brightness=abc")
+    check("brightness=abc -> 400", st == 400, f"got {st}")
+    names = [n for n in ("brightness", "flip", "mirror") if n in ctrls]
+    form = "&".join(f"{n}=0" for n in names).encode()
+    t0 = time.monotonic()
+    st, _, body = post_form(b, form)
+    ms = (time.monotonic() - t0) * 1000
+    try:
+        s = json.loads(body)
+    except ValueError:
+        s = {}
+    ok = st == 200 and all(s.get("ctrl", {}).get(n) == 0 for n in names)
+    check(f"{form.decode()} -> 200, ctrl shows written 0 ({ms:.0f} ms)", ok,
+          f"got {st} {body[-120:]!r}")
+    check("ctrl_applied +1", s.get("ctrl_applied") == (before or 0) + 1,
+          f"{before} -> {s.get('ctrl_applied')}")
 
 
 def t_split(b):
@@ -339,6 +402,7 @@ def main():
     print(f"board: res {before.get('res')}, stack {before.get('stack')}, tls_conns {before.get('tls_conns')}, "
           f"http {before.get('http')}")
     t_routes(b)
+    t_controls(b)
     t_split(b)
     t_limits(b)
     t_policy(b)

@@ -62,6 +62,7 @@ typedef enum {
     CAM_CTRL_E_RANGE,               /* a number, but outside [min, max]      */
     CAM_CTRL_E_DUP,                 /* same control twice in one request     */
     CAM_CTRL_E_TOO_MANY,            /* more than CAM_CTRL_BATCH_MAX          */
+    CAM_CTRL_E_EMPTY,               /* a request that names no control       */
 } cam_ctrl_err_t;
 
 const char *cam_ctrl_err_name(cam_ctrl_err_t e);
@@ -100,6 +101,18 @@ void cam_ctrl_batch_init(cam_ctrl_batch_t *b);
 cam_ctrl_err_t cam_ctrl_batch_add(cam_ctrl_batch_t *b, const cam_ctrl_desc_t *t, unsigned n,
                                   const char *name, size_t name_len,
                                   const char *val, size_t val_len);
+
+/**
+ * Parse an application/x-www-form-urlencoded body ("brightness=3&flip=1")
+ * into @p b. Names and values are percent-decoded ('+' is a space). Strict:
+ * an empty pair, a pair without '=', or a bad escape is CAM_CTRL_E_SYNTAX; no
+ * pairs at all is CAM_CTRL_E_EMPTY. Stops at the first error and copies the
+ * offending name (decoded, truncated) into @p bad_name so the caller can say
+ * which control was refused. @p b is only meaningful on CAM_CTRL_OK.
+ */
+cam_ctrl_err_t cam_ctrl_parse_form(const uint8_t *body, size_t len,
+                                   const cam_ctrl_desc_t *t, unsigned n,
+                                   cam_ctrl_batch_t *b, char *bad_name, size_t bad_cap);
 
 /* ------------------------------- Applying --------------------------------- */
 /**

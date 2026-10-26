@@ -197,6 +197,69 @@ static void test_run_and_record(void)
     CHECK(res.n_ok == 0 && res.failed_at == -1 && s_calls == 0);
 }
 
+static cam_ctrl_err_t form(const char *body, cam_ctrl_batch_t *b, char *bad)
+{
+    return cam_ctrl_parse_form((const uint8_t *)body, strlen(body), k_table, N_TABLE,
+                               b, bad, 16);
+}
+
+static void test_form(void)
+{
+    cam_ctrl_batch_t b;
+    char bad[16];
+
+    CHECK(form("brightness=3", &b, bad) == CAM_CTRL_OK && b.n == 1 &&
+          b.item[0].idx == 0 && b.item[0].value == 3);
+    CHECK(form("flip=1&awb=office&quality=200", &b, bad) == CAM_CTRL_OK && b.n == 3 &&
+          b.item[1].idx == 2 && b.item[1].value == 2 && b.item[2].value == 200);
+    CHECK(form("brightness=-2", &b, bad) == CAM_CTRL_OK && b.item[0].value == -2);
+    CHECK(form("brightness=%2D2", &b, bad) == CAM_CTRL_OK && b.item[0].value == -2);
+    CHECK(form("%62rightness=1", &b, bad) == CAM_CTRL_OK);         /* escaped name */
+
+    /* empty / malformed */
+    CHECK(form("", &b, bad) == CAM_CTRL_E_EMPTY);
+    CHECK(cam_ctrl_parse_form(NULL, 0, k_table, N_TABLE, &b, bad, 16) == CAM_CTRL_E_EMPTY);
+    CHECK(form("&", &b, bad) == CAM_CTRL_E_SYNTAX);
+    CHECK(form("flip=1&", &b, bad) == CAM_CTRL_E_SYNTAX);
+    CHECK(form("flip=1&&awb=1", &b, bad) == CAM_CTRL_E_SYNTAX);
+    CHECK(form("flip", &b, bad) == CAM_CTRL_E_SYNTAX && strcmp(bad, "flip") == 0);
+    CHECK(form("flip=", &b, bad) == CAM_CTRL_E_SYNTAX && strcmp(bad, "flip") == 0);
+    CHECK(form("flip=%2", &b, bad) == CAM_CTRL_E_SYNTAX);
+    CHECK(form("flip=%zz", &b, bad) == CAM_CTRL_E_SYNTAX);
+    CHECK(form("flip=+1", &b, bad) == CAM_CTRL_E_SYNTAX);           /* '+' is a space */
+    CHECK(form("flip=11111111111111111111", &b, bad) == CAM_CTRL_E_SYNTAX);
+
+    /* the refused control is named */
+    CHECK(form("flip=1&brightness=9", &b, bad) == CAM_CTRL_E_RANGE &&
+          strcmp(bad, "brightness") == 0);
+    CHECK(form("zoom=1", &b, bad) == CAM_CTRL_E_UNKNOWN && strcmp(bad, "zoom") == 0);
+    CHECK(form("flip=1&flip=0", &b, bad) == CAM_CTRL_E_DUP && strcmp(bad, "flip") == 0);
+    CHECK(form("averyveryverylongcontrolname=1", &b, bad) == CAM_CTRL_E_UNKNOWN &&
+          strlen(bad) == 15);                                       /* truncated */
+    CHECK(form("awb=Office", &b, bad) == CAM_CTRL_E_SYNTAX && strcmp(bad, "awb") == 0);
+
+    /* fuzz: never crashes, OK only with in-range values */
+    static const char alphabet[] = "flipawbrightnesquality=&%0123456789-+x";
+    char s[40];
+    unsigned seed = 777u;
+    for (int round = 0; round < 50000; round++) {
+        seed = seed * 1103515245u + 12345u;
+        size_t len = (seed >> 16) % sizeof(s);
+        for (size_t i = 0; i < len; i++) {
+            seed = seed * 1103515245u + 12345u;
+            s[i] = alphabet[(seed >> 16) % (sizeof(alphabet) - 1)];
+        }
+        if (cam_ctrl_parse_form((const uint8_t *)s, len, k_table, N_TABLE, &b, bad, 16)
+            == CAM_CTRL_OK) {
+            CHECK(b.n >= 1 && b.n <= CAM_CTRL_BATCH_MAX);
+            for (unsigned i = 0; i < b.n; i++) {
+                const cam_ctrl_desc_t *d = &k_table[b.item[i].idx];
+                CHECK(b.item[i].value >= d->min && b.item[i].value <= d->max);
+            }
+        }
+    }
+}
+
 /* Random text never yields a value outside the range. */
 static void test_fuzz(void)
 {
@@ -228,6 +291,7 @@ int main(void)
     test_values();
     test_batch();
     test_run_and_record();
+    test_form();
     test_fuzz();
     printf("cam_ctrl_test: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

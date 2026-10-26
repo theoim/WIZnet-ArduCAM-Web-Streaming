@@ -48,9 +48,7 @@
 #include "net_load.h"
 #include "cam_driver.h"
 #include "dvp_capture.h"
-#if STREAM_PIPELINE
-#include "cam_pipeline.h"
-#endif
+#include "cam_pipeline.h"       /* frame buffers, and the control command slot */
 #include "web_page.h"
 #include "logo_png.h"
 #if defined(STREAM_HTTPS)
@@ -606,21 +604,150 @@ static int32_t h_reset(uint8_t sn, const http_req_t *r)
     return send_status(sn, false);
 }
 
-/* No sensor control table in this build: an empty list, and /api/cam is
- * accepted and ignored, so the page's panel stays empty instead of failing.
- * Kept as compatibility endpoints until the camera HAL controls exist. */
+/* --------------------------- Camera controls (2c) --------------------------- */
+/*
+ * GET /api/controls - what the driver offers, for the page to build its panel.
+ * An empty list means the driver offers none (OV2640 until the new PCB).
+ */
 static int32_t h_controls(uint8_t sn, const http_req_t *r)
 {
     (void)r;
-    static const char empty[] = "[]";
-    return send_response(sn, "200 OK", "application/json",
-                         empty, (uint32_t)(sizeof(empty) - 1));
+    unsigned cnt = 0;
+    const cam_ctrl_desc_t *t = cam_sensor_controls(&cnt);
+    size_t used = 0, cap = sizeof(g_json);
+    int n = snprintf(g_json, cap, "[");
+    used = (size_t)n;
+
+    for (unsigned i = 0; t && i < cnt; i++) {
+        const cam_ctrl_desc_t *d = &t[i];
+        const char *type = d->type == CAM_CTRL_BOOL ? "bool"
+                         : d->type == CAM_CTRL_ENUM ? "enum" : "int";
+        n = snprintf(g_json + used, cap - used,
+                     "%s{\"name\":\"%s\",\"label\":\"%s\",\"group\":\"Camera\","
+                     "\"type\":\"%s\",\"min\":%d,\"max\":%d,\"provisional\":%s",
+                     i ? "," : "", d->name, d->label, type, d->min, d->max,
+                     (d->flags & CAM_CTRL_F_PROVISIONAL) ? "true" : "false");
+        if (n < 0 || (size_t)n >= cap - used) goto overflow;
+        used += (size_t)n;
+        if (d->type == CAM_CTRL_ENUM && d->enum_names) {
+            n = snprintf(g_json + used, cap - used, ",\"options\":[");
+            if (n < 0 || (size_t)n >= cap - used) goto overflow;
+            used += (size_t)n;
+            for (int k = 0; k <= d->max; k++) {
+                n = snprintf(g_json + used, cap - used, "%s\"%s\"", k ? "," : "",
+                             d->enum_names[k]);
+                if (n < 0 || (size_t)n >= cap - used) goto overflow;
+                used += (size_t)n;
+            }
+            n = snprintf(g_json + used, cap - used, "]");
+            if (n < 0 || (size_t)n >= cap - used) goto overflow;
+            used += (size_t)n;
+        }
+        n = snprintf(g_json + used, cap - used, "}");
+        if (n < 0 || (size_t)n >= cap - used) goto overflow;
+        used += (size_t)n;
+    }
+    n = snprintf(g_json + used, cap - used, "]");
+    if (n < 0 || (size_t)n >= cap - used) goto overflow;
+    used += (size_t)n;
+    return send_response(sn, "200 OK", "application/json", g_json, (uint32_t)used);
+
+overflow:
+    printf("[ctrl] /api/controls does not fit in %u bytes\n", (unsigned)cap);
+    return send_error(sn, 500, NULL);
 }
 
+static int32_t send_json_error(uint8_t sn, const char *status, const char *extra,
+                               const char *msg, const char *control)
+{
+    char body[160];
+    int n;
+    if (control && control[0]) {
+        n = snprintf(body, sizeof(body), "{\"error\":\"%s\",\"control\":\"%s\"}", msg, control);
+    } else {
+        n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
+    }
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
+    }
+    return send_response_hdrs(sn, status, "application/json", extra, body, (uint32_t)n);
+}
+
+/* Content-Type must be form-urlencoded; parameters after ';' are allowed. */
+static bool is_form_content(const http_req_t *r)
+{
+    static const char want[] = "application/x-www-form-urlencoded";
+    size_t len;
+    const uint8_t *v = http_req_header(r, HTTP_H_CONTENT_TYPE, &len);
+    size_t wl = sizeof(want) - 1;
+    if (!v || len < wl) return false;
+    for (size_t i = 0; i < wl; i++) {
+        uint8_t c = v[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32);
+        if (c != (uint8_t)want[i]) return false;
+    }
+    return len == wl || v[wl] == ';' || v[wl] == ' ';
+}
+
+/*
+ * POST /api/cam   Content-Type: application/x-www-form-urlencoded
+ *                 body: brightness=3&flip=1
+ *
+ *   200  every control written -> status document (ctrl = written values)
+ *   400  unknown control, bad value, out of range, duplicate - nothing written
+ *   415  not form-urlencoded
+ *   502  a write failed: the controls before it were written, the rest not
+ *   503  the previous command is still in the slot (Retry-After: 1)
+ *   504  core 1 did not finish in time (withdrawn, or outcome unknown)
+ *
+ * Values are refused, never clamped; a write is reported as written, never as
+ * a value read back from the sensor.
+ */
 static int32_t h_cam(uint8_t sn, const http_req_t *r)
 {
-    (void)r;
-    return send_status(sn, false);
+    if (!is_form_content(r)) {
+        return send_json_error(sn, "415 Unsupported Media Type", NULL,
+                               "use application/x-www-form-urlencoded", NULL);
+    }
+
+    unsigned cnt = 0;
+    const cam_ctrl_desc_t *t = cam_sensor_controls(&cnt);
+    size_t blen = 0;
+    const uint8_t *body = http_req_body(r, &blen);
+    cam_ctrl_batch_t b;
+    char bad[CAM_CTRL_NAME_MAX + 1];
+    cam_ctrl_err_t e = cam_ctrl_parse_form(body, blen, t, cnt, &b, bad, sizeof(bad));
+    if (e != CAM_CTRL_OK) {
+        /* the name came from the request: keep only safe JSON characters */
+        for (char *c = bad; *c; c++) {
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_')) *c = '?';
+        }
+        printf("[ctrl] refused: %s (%s)\n", cam_ctrl_err_name(e), bad);
+        return send_json_error(sn, "400 Bad Request", NULL, cam_ctrl_err_name(e), bad);
+    }
+
+    cam_ctrl_result_t res = { 0, -1, 0 };
+    cam_cmd_rc_t rc = cam_pipeline_set_controls(&b, &res, CAM_CMD_TIMEOUT_MS);
+    switch (rc) {
+    case CAM_CMD_OK:
+        for (unsigned i = 0; i < b.n; i++) {
+            printf("[ctrl] %s = %d written\n", t[b.item[i].idx].name, b.item[i].value);
+        }
+        return send_status(sn, false);
+    case CAM_CMD_FAILED: {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "write failed; %u written before it", (unsigned)res.n_ok);
+        return send_json_error(sn, "502 Bad Gateway", NULL, msg,
+                               t[b.item[res.failed_at].idx].name);
+    }
+    case CAM_CMD_BUSY:
+        return send_json_error(sn, "503 Service Unavailable", "Retry-After: 1\r\n",
+                               cam_cmd_rc_name(rc), NULL);
+    case CAM_CMD_TIMEOUT_NOT_RUN:
+    case CAM_CMD_TIMEOUT_RUNNING:
+    default:
+        return send_json_error(sn, "504 Gateway Timeout", NULL, cam_cmd_rc_name(rc), NULL);
+    }
 }
 
 /* /api/res?v=<WxH> */
@@ -779,7 +906,7 @@ static const route_t g_routes[] = {
     { "/api/stop",     M_GET, ROUTE_ADMIN,  h_stop     },
     { "/api/reset",    M_GET, ROUTE_ADMIN,  h_reset    },
     { "/api/res",      M_GET, ROUTE_ADMIN,  h_res      },
-    { "/api/cam",      M_GET, ROUTE_ADMIN,  h_cam      },
+    { "/api/cam",      M_POST, ROUTE_ADMIN, h_cam      },
     { "/api/clk",      M_GET, ROUTE_DIAG,   h_clk      },
     { "/load",         M_GET, ROUTE_DIAG,   h_load     },
 #if CAM_QB_DIAG
