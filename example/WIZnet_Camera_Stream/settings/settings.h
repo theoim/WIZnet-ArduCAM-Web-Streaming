@@ -54,6 +54,14 @@ const auth_db_t *settings_auth(void);
 /** Save new accounts; the camera part of the record is kept as it is. */
 int settings_save_auth(const auth_db_t *db, char *why, size_t why_cap, uint32_t *ms);
 
+/**
+ * Factory reset: erase both settings sectors - accounts and camera settings.
+ * The firmware and its TLS key are not touched. The caller reboots afterwards,
+ * so the board comes up as a new one: no admin, sensor defaults. Same rules as
+ * a save (core 0, core 1 paused). Returns 0, or -1 with a reason in @p why.
+ */
+int settings_factory_reset(char *why, size_t why_cap, uint32_t *ms);
+
 /** "settings":{...} member for the status document (no leading comma). */
 int settings_status_json(char *buf, size_t cap);
 

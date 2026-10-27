@@ -299,6 +299,64 @@ static void test_errors(void)
     CHECK(sstore_err_name(SSTORE_E_VERIFY)[0] != '?');
 }
 
+/*
+ * Factory reset. Afterwards nothing loads and the store keeps working. A
+ * power cut at either erase leaves the current record or nothing - never the
+ * older record, which may hold an old password. Both layouts: current record
+ * in slot 1 (two saves) and in slot 0 (three saves).
+ */
+static void test_erase_all(void)
+{
+    static uint8_t older[200], cur[200], out[200];
+    sstore_t s, t;
+    uint32_t len;
+    int cases = 0, kept = 0, gone = 0;
+
+    memset(g_flash, 0xFF, sizeof(g_flash));
+    power_on();
+    sstore_init(&s, &k_flash);
+    CHECK(sstore_erase_all(&s) == SSTORE_OK);             /* blank store: fine */
+
+    for (int saves = 2; saves <= 3; saves++) {
+        for (int cut_at = 0; cut_at <= 2; cut_at++) {     /* 0: no cut */
+            memset(g_flash, 0xFF, sizeof(g_flash));
+            power_on();
+            sstore_init(&s, &k_flash);
+            for (int k = 0; k < saves; k++) {
+                fill(k == saves - 1 ? cur : older, sizeof(cur), (uint32_t)(40 + k));
+                CHECK(sstore_save(&s, k == saves - 1 ? cur : older, sizeof(cur), 2) == SSTORE_OK);
+            }
+            CHECK(s.cur == (saves == 2 ? 1 : 0));
+
+            sstore_init(&s, &k_flash);                    /* as after boot: not scanned */
+            g_ops_left = cut_at ? cut_at : -1;
+            sstore_err_t e = sstore_erase_all(&s);
+            CHECK((e == SSTORE_OK) == (cut_at == 0));
+
+            power_on();
+            sstore_init(&t, &k_flash);
+            sstore_err_t le = sstore_load(&t, out, sizeof(out), &len, NULL);
+            if (le == SSTORE_OK) {
+                CHECK(cut_at == 1);                       /* only a cut in the first erase keeps it */
+                CHECK(memcmp(out, cur, sizeof(out)) == 0);
+                kept++;
+            } else {
+                CHECK(le == SSTORE_E_NONE && t.cur == -1);
+                gone++;
+            }
+            cases++;
+
+            fill(out, sizeof(out), 49);                   /* the store keeps working */
+            CHECK(sstore_save(&t, out, sizeof(out), 2) == SSTORE_OK);
+            sstore_init(&s, &k_flash);
+            CHECK(sstore_load(&s, older, sizeof(older), &len, NULL) == SSTORE_OK);
+            CHECK(memcmp(out, older, sizeof(out)) == 0);
+        }
+    }
+    printf("erase all: %d cases, %d kept the current record, %d erased\n", cases, kept, gone);
+    CHECK(kept == 2 && gone == 4);
+}
+
 int main(void)
 {
     test_crc();
@@ -310,6 +368,7 @@ int main(void)
     test_corruption();
     test_gen_wrap();
     test_errors();
+    test_erase_all();
     printf("settings_store_test: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

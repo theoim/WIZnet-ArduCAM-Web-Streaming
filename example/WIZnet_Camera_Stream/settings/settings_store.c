@@ -204,3 +204,20 @@ sstore_err_t sstore_save(sstore_t *s, const void *payload, uint32_t len, uint16_
     s->gen = gen;
     return SSTORE_OK;
 }
+
+sstore_err_t sstore_erase_all(sstore_t *s)
+{
+    if (!s->scanned) {
+        rec_t r[2];
+        scan(s, r);                 /* to know which slot is current */
+    }
+    int first = (s->cur == 0) ? 1 : 0;
+    if (s->f->erase((uint32_t)first * SSTORE_SECTOR) != 0 ||
+        s->f->erase((uint32_t)(1 - first) * SSTORE_SECTOR) != 0) {
+        return SSTORE_E_FLASH;
+    }
+    s->cur = -1;
+    s->gen = 0;
+    s->scanned = true;
+    return SSTORE_OK;
+}

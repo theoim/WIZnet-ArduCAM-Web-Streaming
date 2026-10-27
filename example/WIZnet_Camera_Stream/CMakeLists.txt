@@ -50,12 +50,13 @@ string(TIMESTAMP CAM_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 # only - nothing is written. Off in normal images.
 option(CAM_QB_DIAG "Log the Arducam controller's control registers (read only)" OFF)
 
-# Phase 3b: creating the first admin needs setup mode, which the product opens
-# from a physical button (Q3). This PCB has none, so a development image can
-# open it from the USB console ("setup"). OFF: no console path - an image that
+# Phase 3b: creating the first admin needs setup mode, and a factory reset
+# erases the accounts again - both meant for a physical button (Q3, Q8). This
+# PCB has none, so a development image takes them from the USB console
+# ("setup", "factory-reset" + "yes"). OFF: no console path - an image that
 # also has no admin account yet cannot be set up; flash one built with this ON,
 # create the admin (it is kept in flash across UF2 updates), then flash back.
-option(CAM_SETUP_SERIAL "Open setup mode from the USB console (development only)" OFF)
+option(CAM_SETUP_SERIAL "Setup mode and factory reset from the USB console (development only)" OFF)
 
 set(CAM_COMMON_DEFS
         CAM_MODULE_HEADER="modules/${CAMERA_MODULE}.h"
@@ -63,7 +64,7 @@ set(CAM_COMMON_DEFS
         CAM_BUILD_UTC="${CAM_BUILD_UTC}")
 if(CAM_SETUP_SERIAL)
     list(APPEND CAM_COMMON_DEFS CAM_SETUP_SERIAL=1)
-    message(STATUS "camera_stream: CAM_SETUP_SERIAL on - 'setup' on the USB console opens setup mode")
+    message(STATUS "camera_stream: CAM_SETUP_SERIAL on - 'setup' and 'factory-reset' on the USB console")
 else()
     list(APPEND CAM_COMMON_DEFS CAM_SETUP_SERIAL=0)
 endif()
@@ -144,7 +145,7 @@ else()
     target_link_libraries(camera_stream PRIVATE
             pico_stdlib hardware_dma hardware_i2c hardware_pio hardware_pwm
             hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash
-            ETHERNET_FILES IOLIBRARY_FILES)
+            hardware_watchdog ETHERNET_FILES IOLIBRARY_FILES)
 
     pico_enable_stdio_usb(camera_stream 1)
     pico_enable_stdio_uart(camera_stream 0)
@@ -245,7 +246,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
         target_link_libraries(camera_stream_https PRIVATE
                 pico_stdlib pico_rand hardware_dma hardware_i2c hardware_pio hardware_pwm
                 hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash
-                ETHERNET_FILES IOLIBRARY_FILES)
+                hardware_watchdog ETHERNET_FILES IOLIBRARY_FILES)
         pico_enable_stdio_usb(camera_stream_https 1)
         pico_enable_stdio_uart(camera_stream_https 0)
         pico_add_extra_outputs(camera_stream_https)

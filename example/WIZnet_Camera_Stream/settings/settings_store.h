@@ -74,6 +74,14 @@ sstore_err_t sstore_load(sstore_t *s, void *buf, uint32_t cap, uint32_t *len,
 sstore_err_t sstore_save(sstore_t *s, const void *payload, uint32_t len,
                          uint16_t version);
 
+/**
+ * Erase both slots: the next load finds nothing (factory reset). The slot NOT
+ * holding the current record goes first, so a power cut part way leaves
+ * either the current record or nothing - never an older record coming back
+ * (an old password, say).
+ */
+sstore_err_t sstore_erase_all(sstore_t *s);
+
 uint32_t sstore_crc32(const void *data, uint32_t len);
 
 #endif /* SETTINGS_STORE_H */

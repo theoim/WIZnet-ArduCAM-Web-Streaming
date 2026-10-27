@@ -246,6 +246,30 @@ int settings_save_auth(const auth_db_t *db, char *why, size_t why_cap, uint32_t 
     return save_rec(&rec, why, why_cap, ms);
 }
 
+int settings_factory_reset(char *why, size_t why_cap, uint32_t *ms)
+{
+    *ms = 0;
+    if (!s_ready) {
+        snprintf(why, why_cap, "flash not usable");
+        return -1;
+    }
+    absolute_time_t t0 = get_absolute_time();
+    cam_pipeline_pause();
+    sstore_err_t e = sstore_erase_all(&s_store);
+    cam_pipeline_resume();
+    *ms = (uint32_t)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
+    if (e != SSTORE_OK) {
+        snprintf(why, why_cap, "%s", sstore_err_name(e));
+        printf("[settings] factory reset failed: %s (%lu ms)\n", why, (unsigned long)*ms);
+        return -1;
+    }
+    memset(&s_rec, 0, sizeof(s_rec));
+    s_cam_ok = false;
+    s_note   = "erased";
+    printf("[settings] factory reset: both sectors erased in %lu ms\n", (unsigned long)*ms);
+    return 0;
+}
+
 int settings_status_json(char *buf, size_t cap)
 {
     int n;

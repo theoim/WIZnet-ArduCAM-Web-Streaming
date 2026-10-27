@@ -55,6 +55,7 @@
 #include "tls_server.h"
 #endif
 #include "web_page_gz.h"        /* generated from web/index.html */
+#include "hardware/watchdog.h"  /* reboot after the console factory reset */
 #include "logo_png.h"
 #if defined(STREAM_HTTPS)
 #include "tls_server.h"
@@ -1874,6 +1875,9 @@ void net_server_init(void)
 #endif
                );
     }
+#if CAM_SETUP_SERIAL
+    printf("[auth] console: 'factory-reset' erases the accounts and camera settings\n");
+#endif
 #endif
 
     printf("HTTP camera server ready (" STACK_NAME ", %u listeners, %u request contexts)\n",
@@ -1898,14 +1902,27 @@ static void auth_housekeeping(void)
     static uint32_t last;
     uint32_t t = now_ms();
 #if CAM_SETUP_SERIAL
-    /* Development build only: no setup button on this PCB yet (Q3 asks for a
-     * physical one). 'setup' typed on the USB console opens setup mode. */
+    /* Development build only: no button on this PCB yet (Q3/Q8 ask for a
+     * physical one). On the USB console:
+     *   setup          open setup mode, when there is no admin yet
+     *   factory-reset  then "yes" within 10 s: erase accounts and camera
+     *                  settings, reboot as a new board
+     * Whatever opens these later (a button, something else) calls the same
+     * two actions; only this trigger is development-only. */
     static char line[16];
     static uint8_t len;
+    static uint32_t reset_armed;        /* now_ms() of 'factory-reset', 0 = not */
     int c;
     while ((c = getchar_timeout_us(0)) >= 0) {
         if (c == '\r' || c == '\n') {
+            if (len == 0) {
+                continue;               /* the \n of a \r\n, or a bare Enter:
+                                         * not a line, so it must not cancel
+                                         * a pending 'factory-reset' */
+            }
             line[len] = 0;
+            bool armed = reset_armed && now_ms() - reset_armed < 10000u;
+            reset_armed = 0;            /* any other line ends the confirmation */
             if (strcmp(line, "setup") == 0) {
                 if (auth_provisioned(&g_db)) {
                     printf("[auth] already set up - setup mode not opened\n");
@@ -1913,6 +1930,24 @@ static void auth_housekeeping(void)
                     g_setup_until = now64() + 5u * 60u * 1000u;
                     printf("[auth] setup mode OPEN for 5 minutes - create the admin in the browser\n");
                 }
+            } else if (strcmp(line, "factory-reset") == 0) {
+                reset_armed = now_ms() | 1u;
+                printf("[reset] this erases the accounts and the camera settings, then reboots.\n"
+                       "[reset] type 'yes' + Enter within 10 s to go ahead\n");
+            } else if (strcmp(line, "yes") == 0 && armed) {
+                char why[48];
+                uint32_t ms;
+                if (settings_factory_reset(why, sizeof(why), &ms) == 0) {
+                    printf("[reset] done - rebooting as a new board (no admin, sensor defaults)\n");
+                    sleep_ms(100);      /* let the USB console drain */
+                    watchdog_reboot(0, 0, 0);
+                    for (;;) {
+                        tight_loop_contents();
+                    }
+                }
+                printf("[reset] FAILED: %s - reboot and check whether the admin is still there\n", why);
+            } else if (armed || strcmp(line, "yes") == 0) {
+                printf("[reset] not confirmed - nothing erased\n");
             }
             len = 0;
         } else if (len + 1u < sizeof(line)) {
