@@ -54,7 +54,7 @@
 #include "session.h"
 #include "tls_server.h"
 #endif
-#include "web_page.h"
+#include "web_page_gz.h"        /* generated from web/index.html */
 #include "logo_png.h"
 #if defined(STREAM_HTTPS)
 #include "tls_server.h"
@@ -718,11 +718,20 @@ static bool query_u8(const http_req_t *r, const char *key, uint8_t *out)
     return true;
 }
 
+/*
+ * The page is gzip'd at build time (tools/page_gz.py) and sent as stored: a
+ * third of the bytes on the wire, through TLS and in flash, and nothing to do
+ * per request. There is no plain copy to fall back to. Every browser takes
+ * gzip, and a request with no Accept-Encoding accepts any coding (RFC 9110
+ * 12.5.3).
+ */
 static int32_t h_index(uint8_t sn, const http_req_t *r)
 {
     (void)r;
-    return send_response(sn, "200 OK", "text/html; charset=utf-8",
-                         HTTP_INDEX_PAGE, (uint32_t)(sizeof(HTTP_INDEX_PAGE) - 1));
+    return send_response_hdrs(sn, "200 OK", "text/html; charset=utf-8",
+                              "Content-Encoding: gzip\r\n",
+                              (const char *)HTTP_INDEX_PAGE_GZ,
+                              (uint32_t)sizeof(HTTP_INDEX_PAGE_GZ));
 }
 
 /*

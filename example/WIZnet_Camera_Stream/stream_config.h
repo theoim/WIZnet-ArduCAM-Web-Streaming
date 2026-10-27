@@ -189,10 +189,11 @@
  * With it off the visitor sees one stack running clean, not the TOE holding up
  * while lwIP gives way. If the load is meant to be part of the demo, either
  * set this to 0 or drive the load from the host instead of the page.
+ *
+ * The switch is the CMake option EXHIBITION_SIMPLE_UI (default ON), not a
+ * #define here: the page is web/index.html, built into a gzip'd array by
+ * tools/page_gz.py, so the C preprocessor never sees it.
  */
-#ifndef EXHIBITION_SIMPLE_UI
-#define EXHIBITION_SIMPLE_UI 1
-#endif
 
 #define FAIL_STREAK_RECOVER 10          /* failed captures before a sensor reset */
 #define MJPEG_BOUNDARY      "wiznetframe"

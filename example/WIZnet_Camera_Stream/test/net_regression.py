@@ -37,6 +37,7 @@ exists; otherwise certificate checks are off. No private key is touched.
 """
 
 import argparse
+import gzip
 import json
 import os
 import socket
@@ -201,6 +202,15 @@ def t_routes(b):
         st, hdr, body = parse(b.get(path))
         ok = st == want and (ctype is None or hdr.get("content-type", "").startswith(ctype))
         check(f"GET {path} -> {want}", ok, f"got {st}")
+    st, hdr, body = parse(b.get("/"))
+    try:
+        page = gzip.decompress(body)
+    except (OSError, EOFError):
+        page = b""
+    check("GET / is gzip'd and unzips to the page",
+          hdr.get("content-encoding") == "gzip" and page.startswith(b"<!DOCTYPE html>")
+          and page.rstrip().endswith(b"</html>"),
+          f"encoding {hdr.get('content-encoding')}, {len(body)} -> {len(page)} bytes")
     st, hdr, _ = parse(b.roundtrip(b"POST /api/status HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"))
     check("POST /api/status -> 405 + Allow: GET", st == 405 and hdr.get("allow") == "GET", f"got {st} {hdr.get('allow')}")
     st, _, _ = parse(b.roundtrip(b"DELETE / HTTP/1.1\r\nHost: x\r\n\r\n"))

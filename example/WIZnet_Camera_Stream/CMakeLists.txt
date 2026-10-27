@@ -72,6 +72,26 @@ if(CAM_QB_DIAG)
     message(STATUS "camera_stream: CAM_QB_DIAG on - control registers logged (read only)")
 endif()
 
+# The page is web/index.html. tools/page_gz.py drops its notes, applies the
+# @if switches below and gzips it into web_page_gz.h here in the build
+# directory; the firmware sends those bytes with Content-Encoding: gzip.
+# web_page.html next to it is the page as the browser gets it, for checking.
+option(EXHIBITION_SIMPLE_UI "Page: logo, picture and graphs only (stream_config.h says why)" ON)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(CAM_PAGE_GZ_H ${CMAKE_CURRENT_BINARY_DIR}/web_page_gz.h)
+add_custom_command(
+        OUTPUT ${CAM_PAGE_GZ_H} ${CMAKE_CURRENT_BINARY_DIR}/web_page.html
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tools/page_gz.py
+                ${CMAKE_CURRENT_LIST_DIR}/web/index.html
+                ${CAM_PAGE_GZ_H}
+                ${CMAKE_CURRENT_BINARY_DIR}/web_page.html
+                EXHIBITION_SIMPLE_UI=$<BOOL:${EXHIBITION_SIMPLE_UI}>
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/web/index.html
+                ${CMAKE_CURRENT_LIST_DIR}/tools/page_gz.py
+        COMMENT "camera page: web/index.html -> web_page_gz.h"
+        VERBATIM)
+add_custom_target(camera_page DEPENDS ${CAM_PAGE_GZ_H})
+
 # --------------------------------------------------------------- probe -------
 add_executable(camera_probe
         ${CMAKE_CURRENT_LIST_DIR}/probe_main.c
@@ -119,6 +139,8 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/auth)
     target_compile_definitions(camera_stream PRIVATE ${CAM_COMMON_DEFS} NET_STACK_TOE=1)
     pico_generate_pio_header(camera_stream ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
+    target_include_directories(camera_stream PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    add_dependencies(camera_stream camera_page)
     target_link_libraries(camera_stream PRIVATE
             pico_stdlib hardware_dma hardware_i2c hardware_pio hardware_pwm
             hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash
@@ -218,6 +240,8 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CAM_COMMON_DEFS} NET_STACK_TOE=1 STREAM_HTTPS=1 CAM_AUTH=1
                 MBEDTLS_CONFIG_FILE="${CMAKE_CURRENT_LIST_DIR}/tls/https_config.h")
         pico_generate_pio_header(camera_stream_https ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.pio)
+        target_include_directories(camera_stream_https PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+        add_dependencies(camera_stream_https camera_page)
         target_link_libraries(camera_stream_https PRIVATE
                 pico_stdlib pico_rand hardware_dma hardware_i2c hardware_pio hardware_pwm
                 hardware_gpio hardware_clocks pico_multicore pico_flash hardware_flash

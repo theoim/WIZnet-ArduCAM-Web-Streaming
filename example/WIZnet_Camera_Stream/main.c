@@ -10,7 +10,7 @@
  *   cam_state.c           capture state, the one-second window, the status JSON
  *   cam_controls.c        the sensor control table
  *   net_load.c            the load generator's payload and accounting
- *   web_page.h            the page
+ *   web/index.html        the page (gzip'd into web_page_gz.h at build time)
  *   server_toe.c          hardware TCP/IP
  *   server_lwip.c         software TCP/IP
  *
