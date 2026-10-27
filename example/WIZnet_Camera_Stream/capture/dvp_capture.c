@@ -83,10 +83,11 @@ void cam_capture_init(void)
 
     camera.dma_channel = dma_claim_unused_channel(true);
 
-    uint offset = pio_add_program(camera.pio, &image_program);
-    pio_sm_config c = image_program_get_default_config(offset);
+    uint offset = pio_add_program(camera.pio, &dvp_capture_program);
+    pio_sm_config c = dvp_capture_program_get_default_config(offset);
 
     sm_config_set_in_pins(&c, camera.pin_d0);
+    sm_config_set_jmp_pin(&c, camera.pin_d0 + dvp_capture_HREF_OFFSET);
     sm_config_set_in_shift(&c, true, true, 32);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
     sm_config_set_clkdiv(&c, 1.0f);

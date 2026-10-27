@@ -1,21 +1,37 @@
-.program image
+; 8-bit DVP receiver: on every rising edge of PCLK, keep the byte on D0..D7
+; if HREF is high at that edge, otherwise let it go.
+;
+; Written for this SDK from the DVP definition (a byte is valid when HREF is
+; high at a rising edge of PCLK) and the RP2350 PIO instruction set. The input
+; pins are consecutive, counted from the in_base the C side sets, and HREF is
+; also the JMP pin (dvp_capture.c):
+;
+;   in_base + 0..7   D0..D7
+;   in_base + 8      PCLK
+;   in_base + 9      HREF   (sm_config_set_jmp_pin)
+;
+; Each kept byte goes into the ISR; the C side turns on autopush at 32 bits
+; with the shift to the right, so a FIFO word holds four bytes in arrival
+; order and the DMA writes them to memory as they came. VSYNC is not watched
+; here: the C side waits for it on a GPIO and clears the FIFO before a frame.
+;
+; HREF is checked at each edge rather than waited for once per line: the
+; first byte of a line can arrive with HREF and PCLK rising together, and a
+; receiver that waits for HREF and then for the next PCLK edge drops it -
+; every line one byte short, the whole frame shifted (seen on the LH module,
+; 2026-10-27).
+
+.program dvp_capture
+
+.define PUBLIC PCLK_OFFSET 8
+.define PUBLIC HREF_OFFSET 9
+
 .wrap_target
-
-	wait 1 pin 9 // wait for hsync
-	wait 1 pin 8 // wait for rising pclk
-	in pins 8
-	wait 0 pin 8
+    wait 1 pin PCLK_OFFSET      ; rising edge
+    jmp pin take                ; HREF high: this byte belongs to the line
+    jmp edge_done               ; blanking: nothing to keep
+take:
+    in pins, 8
+edge_done:
+    wait 0 pin PCLK_OFFSET      ; back to low before looking for the next edge
 .wrap
-
-% c-sdk {
-void image_program_init(PIO pio, uint sm, uint offset, uint pin_base) {
-	pio_sm_set_consecutive_pindirs(pio, sm, pin_base, 10, false);
-
-	pio_sm_config c = image_program_get_default_config(offset);
-	sm_config_set_in_pins(&c, pin_base);
-	sm_config_set_in_shift(&c, false, true, 8);
-	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
-	
-	pio_sm_init(pio, sm, offset, &c);
-}
-%}
