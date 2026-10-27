@@ -21,7 +21,6 @@
  * Endpoints
  *   GET /                 the page
  *   GET /stream           multipart/x-mixed-replace MJPEG
- *   GET /logo.png         logo, cached by the browser
  *   GET /load?kb=N        N KB of filler - the load generator
  *   GET /api/start|stop   begin / end capture        -> status JSON
  *   GET /api/status       current state              -> status JSON

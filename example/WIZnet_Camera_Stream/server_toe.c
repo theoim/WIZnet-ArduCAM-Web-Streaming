@@ -56,7 +56,6 @@
 #endif
 #include "web_page_gz.h"        /* generated from web/index.html */
 #include "hardware/watchdog.h"  /* reboot after the console factory reset */
-#include "logo_png.h"
 #if defined(STREAM_HTTPS)
 #include "tls_server.h"
 #endif
@@ -733,31 +732,6 @@ static int32_t h_index(uint8_t sn, const http_req_t *r)
                               "Content-Encoding: gzip\r\n",
                               (const char *)HTTP_INDEX_PAGE_GZ,
                               (uint32_t)sizeof(HTTP_INDEX_PAGE_GZ));
-}
-
-/*
- * The logo is the one asset the page pulls in. Unlike the status responses
- * it never changes, so let the browser keep it rather than refetch it on
- * every reload - and on a show floor the page gets reloaded a lot.
- */
-static int32_t h_logo(uint8_t sn, const http_req_t *r)
-{
-    (void)r;
-    int n = snprintf(g_tx_hdr, sizeof(g_tx_hdr),
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: image/png\r\n"
-                     "Content-Length: %lu\r\n"
-                     "Cache-Control: max-age=86400\r\n"
-                     "Connection: close\r\n"
-                     "\r\n",
-                     (unsigned long)sizeof(LOGO_PNG));
-    if (n <= 0) {
-        return -1;
-    }
-    if (tcp_send_all(sn, (const uint8_t *)g_tx_hdr, (uint32_t)n) < 0) {
-        return -1;
-    }
-    return tcp_send_all(sn, LOGO_PNG, (uint32_t)sizeof(LOGO_PNG));
 }
 
 /* The page tags each open: /stream?<counter>&r=<why>&p=<drawn>,<ms since last>. */
@@ -1439,7 +1413,6 @@ typedef struct {
 static const route_t g_routes[] = {
     { "/",             M_GET, ROUTE_PUBLIC, h_index    },
     { "/index.html",   M_GET, ROUTE_PUBLIC, h_index    },
-    { "/logo.png",     M_GET, ROUTE_PUBLIC, h_logo     },
     { "/stream",       M_GET, ROUTE_VIEW,   h_stream   },
     { "/snapshot.jpg", M_GET, ROUTE_VIEW,   h_snapshot },
     { "/api/status",   M_GET, ROUTE_VIEW,   h_status   },

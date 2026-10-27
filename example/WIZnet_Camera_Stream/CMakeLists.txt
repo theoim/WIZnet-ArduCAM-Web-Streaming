@@ -77,7 +77,7 @@ endif()
 # @if switches below and gzips it into web_page_gz.h here in the build
 # directory; the firmware sends those bytes with Content-Encoding: gzip.
 # web_page.html next to it is the page as the browser gets it, for checking.
-option(EXHIBITION_SIMPLE_UI "Page: logo, picture and graphs only (stream_config.h says why)" ON)
+option(EXHIBITION_SIMPLE_UI "Page: name, picture and graphs only (stream_config.h says why)" ON)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(CAM_PAGE_GZ_H ${CMAKE_CURRENT_BINARY_DIR}/web_page_gz.h)
 add_custom_command(

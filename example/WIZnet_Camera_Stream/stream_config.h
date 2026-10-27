@@ -102,10 +102,11 @@
  * Eight, not four, since the OV2640 port.
  *
  * The budget above counts what a steady page needs. A reload is not steady: the
- * browser asks for the page, the logo, the stream and a status poll at once,
- * while the stream connection the old page abandoned is still held - the board
- * has no way to know that tab is gone until the FIN arrives. Five wanted, four
- * available, and the one that loses is whichever arrives last. When that is the
+ * browser asks for the page, the logo (since removed), the stream and a
+ * status poll at once, while the stream connection the old page abandoned is
+ * still held - the board has no way to know that tab is gone until the FIN
+ * arrives. Five wanted, four available, and the one that loses is whichever
+ * arrives last. When that is the
  * stream, the page sits on a black <img> while the board happily streams at
  * full rate into the connection nobody is watching: the status line says
  * STREAMING and 11.8 fps, and the screen is black.
@@ -171,7 +172,7 @@
  * picture down until the graphs fall below the fold - so the one thing the
  * exhibit is about, the stream degrading under load, is off screen.
  *
- * At 1 the page is: logo, stack badge, picture edge to edge, then the two
+ * At 1 the page is: name, stack badge, picture edge to edge, then the two
  * graphs. Everything a visitor cannot use is hidden, which is everything that
  * needs a decision:
  *

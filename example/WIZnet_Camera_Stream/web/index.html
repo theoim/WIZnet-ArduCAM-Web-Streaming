@@ -14,8 +14,10 @@
   - "/* @if NAME */" ... "/* @endif */" is a build switch; NAME comes from
     CMake (EXHIBITION_SIMPLE_UI today). Lines between are dropped when it is 0.
   - Everything is in this one file: no external CSS, JS, fonts or images,
-    because the device is often the only server the browser can reach. The
-    logo is the one exception, served from /logo.png.
+    because the device is often the only server the browser can reach.
+  - No logo: the header shows a plain-text name (#brand) that a product
+    build replaces with its own. A code licence gives no right to anyone's
+    logo, so the SDK ships none.
 
   Both firmware images serve this same page. The badge and the accent colour
   come from the "stack" field of /api/status, and the sensor panel is built
@@ -31,7 +33,7 @@
 <title>WIZnet Camera Stream</title>
 <!-- An empty data: icon, purely to stop the browser asking for /favicon.ico.
    That request is one more TCP connection during the busiest second this
-   device has - the page, the logo, the control list, the first status poll and
+   device has - the page, the control list, the first status poll and
    the stream are all in flight at the same moment - and it exists only to be
    answered 404. Thirty bytes here buys a connection back. -->
 <link rel='icon' href='data:,'>
@@ -56,7 +58,8 @@ body{margin:0;background:var(--bg);color:var(--text);
 /* --- Header: sized for a screen seen from a few metres away --- */
 header{display:flex;align-items:center;gap:18px;padding:12px 24px;
   background:var(--panel);border-bottom:3px solid var(--stack)}
-header .logo{height:52px;display:block}
+header .logo{display:block;font-size:22px;font-weight:700;line-height:52px;
+  letter-spacing:.5px;white-space:nowrap;color:var(--text)}
 header .sub{color:var(--muted);font-size:13px}
 header .sub b{color:var(--text);font-weight:600}
 header .stackbox{margin-left:auto;display:flex;align-items:center;gap:16px}
@@ -265,13 +268,10 @@ body{min-height:100vh;display:flex;flex-direction:column}
    white down both sides. */
 main{flex:1 1 auto;min-height:0;max-width:none;margin:0;padding:8px;gap:8px;
   grid-template-columns:1fr;grid-template-rows:minmax(200px,1fr) auto auto}
-/* Logo over badge, both centred. A visitor reads top to bottom from a few
-   metres away and the badge is what they are meant to come away with, so it
-   sits directly under the logo with nothing competing beside it. */
-/* No longer a booth exhibit, so no stack badge and no graphs: logo on the
-   left, frame rate and bandwidth as plain numbers on the right. */
+/* No longer a booth exhibit, so no stack badge and no graphs: the name on
+   the left, frame rate and bandwidth as plain numbers on the right. */
 header{padding:8px 16px;border-bottom-width:2px}
-header .logo{height:34px}
+header .logo{font-size:18px;line-height:34px}
 header .stackbox,#sec-perf{display:none}
 header .stackbox{margin-left:0;flex-direction:column;align-items:center;
   gap:3px}
@@ -372,7 +372,7 @@ canvas{height:110px}
 </head>
 <body>
 <header>
-  <img class='logo' src='/logo.png' alt='WIZnet'>
+  <div class='logo' id='brand'>Camera Stream</div>
   <div class='sub'>ArduCAM MEGA &middot; <b id='addr'></b></div>
   <div class='stackbox'>
     <div class='what' id='what'>&nbsp;</div>

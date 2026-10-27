@@ -195,7 +195,7 @@ def wait_closed(s, limit):
 def t_routes(b):
     print("routes")
     for path, want, ctype in [("/", 200, "text/html"), ("/index.html", 200, "text/html"),
-                              ("/logo.png", 200, "image/png"), ("/api/status", 200, "application/json"),
+                              ("/logo.png", 404, None), ("/api/status", 200, "application/json"),
                               ("/api/controls", 200, "application/json"), ("/api/cam?brightness=1", 405, None),
                               ("/load?kb=1", 200, None), ("/load", 200, None),
                               ("/nope", 404, None), ("/api/status/x", 404, None)]:
@@ -365,7 +365,7 @@ def t_policy(b):
 def t_pipeline(b):
     print("pipeline")
     two = (b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n"
-           b"GET /logo.png HTTP/1.1\r\nHost: x\r\n\r\n")
+           b"GET /api/controls HTTP/1.1\r\nHost: x\r\n\r\n")
     resp = b.roundtrip(two)
     n = resp.count(b"HTTP/1.1 ")
     check("two requests in one write -> one response", n == 1 and resp.startswith(b"HTTP/1.1 200"), f"{n} responses")
