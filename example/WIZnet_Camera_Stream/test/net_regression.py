@@ -488,6 +488,13 @@ def t_status(b, n):
             st = 0
         lat.append((time.monotonic() - t0) * 1000)
         bad += st != 200
+        # A SYN that lands within ~0.1 ms of the previous connection's last
+        # packet goes unanswered and the PC retries after 1 s. Captured
+        # 2026-10-27: back-to-back polls hit it 3 in 300 times, polls 5 ms
+        # apart never (also not at 50 ms). A browser polls once a second, so
+        # this is a property of the W6300 listener hand-over, not something
+        # this test should keep rediscovering.
+        time.sleep(0.005)
     # where the time of the slowest polls went (2026-10-26: ~1 s outliers)
     for tot, i, c, h, q, res in sorted(rows, reverse=True)[:3]:
         print(f"  slow poll #{i}: {tot:.0f} ms = connect {c:.0f} + tls {h:.0f}"
