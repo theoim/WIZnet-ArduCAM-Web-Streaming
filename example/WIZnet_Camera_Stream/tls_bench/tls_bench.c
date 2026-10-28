@@ -30,6 +30,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "build_stamp.h"
+
 #include "pico/stdlib.h"
 #include "pico/rand.h"
 #include "hardware/clocks.h"

@@ -665,7 +665,7 @@ def t_auth(b, a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.11.7")
-    ap.add_argument("--plain", action="store_true", help="port 80 image (camera_stream)")
+    ap.add_argument("--plain", action="store_true", help="port 80 image (camera_plain_dev)")
     ap.add_argument("--quick", action="store_true", help="skip the drip test")
     ap.add_argument("--polls", type=int, default=200)
     ap.add_argument("--user", default=os.environ.get("CAM_ADMIN_USER"))

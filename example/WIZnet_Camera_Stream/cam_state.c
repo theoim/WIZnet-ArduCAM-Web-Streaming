@@ -8,6 +8,8 @@
 #include <string.h>
 #include <malloc.h>
 
+#include "build_stamp.h"
+
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/regs/addressmap.h"
@@ -545,7 +547,8 @@ int cam_state_status_json(char *buf, size_t cap)
 
     /* build: which image is running - the boot log is usually gone by the time
      * USB serial is attached. settings: what is saved in flash. */
-    n = snprintf(buf + used, cap - used, ",\"build\":\"%s\",", CAM_BUILD_GIT);
+    n = snprintf(buf + used, cap - used, ",\"build\":\"%s\",\"built\":\"%s\",",
+                 CAM_BUILD_GIT, CAM_BUILD_UTC);
     if (n < 0 || (size_t)n >= cap - used) {
         return -1;
     }

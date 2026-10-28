@@ -33,6 +33,8 @@
 
 #include <stdio.h>
 
+#include "build_stamp.h"
+
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 
