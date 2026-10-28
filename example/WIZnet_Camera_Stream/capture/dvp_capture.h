@@ -1,6 +1,6 @@
 /**
  * @file    dvp_capture.h
- * @brief   8-bit DVP capture into image_buff: PIO + DMA + JPEG end detection.
+ * @brief   8-bit DVP capture into a frame buffer: PIO + DMA + JPEG end detection.
  *
  * Sensor independent. It was the same code in arducam_mega.c and ov2640.c,
  * byte for byte apart from the object name, and lives here once now.
@@ -29,10 +29,8 @@ typedef struct {
     /* current mode - written by the sensor driver */
     pixfmt_t pixfmt;
     res_t    res;
-    uint32_t line_length;      /* DMA chunk size; in JPEG not a real row */
 
     /* last capture */
-    uint32_t line_num;
     uint32_t frame_length;
 } cam_capture_t;
 
@@ -42,8 +40,9 @@ void cam_capture_init(void);
 
 /* Capture one frame into buf (4-byte aligned, cap bytes).
  * 0 = a complete JPEG (SOI..EOI), camera.frame_length bytes.
- * -1 bad frame, -2 VSYNC timeout, -3 DMA timeout, -4 no EOI (the tail was
- * lost), -5 the frame is larger than cap (the sensor is fine). Blocks for VSYNC: in the pipelined build only core 1 calls it. */
+ * -1 no SOI after three tries, -2 VSYNC timeout, -3 the DMA stalled mid-frame,
+ * -4 no EOI (the tail was lost), -5 the frame is larger than cap (the sensor
+ * is fine). Blocks for VSYNC: in the pipelined build only core 1 calls it. */
 int  cam_capture_frame_into(uint8_t *buf, uint32_t cap);
 
 /* Sequential build only (STREAM_PIPELINE 0): one 200 KB buffer. */
@@ -54,9 +53,5 @@ int  cam_capture_frame(void);
 /* Profiling of the last successful capture. */
 extern volatile uint32_t cam_vsync_wait_us;   /* blocked waiting for frame start */
 extern volatile uint32_t cam_readout_us;      /* pulling pixel data              */
-extern volatile uint32_t cam_line_count;
-extern volatile uint32_t cam_parse_pos;
-extern volatile uint8_t  cam_in_scan;
-extern volatile uint32_t cam_jpeg_end;
 
 #endif /* DVP_CAPTURE_H */

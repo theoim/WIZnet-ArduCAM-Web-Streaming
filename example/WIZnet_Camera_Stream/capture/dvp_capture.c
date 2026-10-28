@@ -1,20 +1,24 @@
 /**
  * @file    dvp_capture.c
- * @brief   8-bit DVP capture into image_buff: PIO + DMA + JPEG end detection.
+ * @brief   8-bit DVP capture into a frame buffer: PIO + one DMA transfer +
+ *          JPEG end detection.
  *
- * Moved here unchanged from the OV2640 exhibition driver (ov2640.c), which had
- * it unchanged from arducam_mega.c - the two were identical apart from the name
- * of the global object. The comments inside cam_capture_frame() are the
- * originals and still describe it exactly; only names changed:
+ * The PIO program (dvp_capture.pio) pushes a 32-bit word for every four bytes
+ * the sensor clocks out while HREF is high. One DMA transfer, armed during
+ * vertical blanking, moves those words into the whole buffer. The CPU never
+ * re-arms anything while the frame is coming in: it only watches how far the
+ * DMA has written and walks the JPEG behind it until the EOI marker.
  *
- *   camera.frame.line.length  -> camera.line_length
- *   camera.frame.line.num     -> camera.line_num
- *   camera.frame.frame_length -> camera.frame_length
- *   camera.pio_receiver.*     -> camera.pio / pio_sm / dma_channel
- *   ov2640_*_us, ov2640_*     -> cam_*
+ * Why one transfer: the earlier capture took the frame in 512-byte DMA
+ * transfers and re-armed the channel from the CPU after each one. The PIO
+ * FIFO and shift register hold 36 bytes, so a re-arm that came late lost the
+ * bytes after that - on the OV2640 about one frame in a thousand came out with
+ * 6-8 bytes missing at offset 548 = 512 + 32 + 4, in the last Huffman table,
+ * with the old and the new PIO program alike (measured 2026-10-28). With a
+ * single transfer there is no re-arm, so no deadline for the CPU to miss.
  *
- * Dropped: line.flag_top / flag_end, which nothing read, and line.buffer, a
- * 5 KB array the DMA was only ever pointed at during configuration.
+ * Written for this SDK on 2026-10-28, replacing the capture loop inherited
+ * from the ArduCAM sample (see the provenance notes).
  */
 
 #include <stdio.h>
@@ -23,6 +27,7 @@
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
+#include "hardware/sync.h"
 
 #include "dvp_capture.h"
 #include "dvp_capture.pio.h"
@@ -50,30 +55,17 @@ cam_capture_t camera = {
     .pio         = pio0,
     .pio_sm      = 0,
     .pixfmt      = PIXFORMAT_JPEG,
-    .line_length = 512,
 };
 
 volatile uint32_t cam_vsync_wait_us = 0;
 volatile uint32_t cam_readout_us    = 0;
-volatile uint32_t cam_line_count    = 0;
-volatile uint32_t cam_parse_pos     = 0;
-volatile uint8_t  cam_in_scan       = 0;
-volatile uint32_t cam_jpeg_end      = 0;
 
-/*
- * Each line is DMA'd straight into its final place in image_buff.
- *
- * The PIO RX FIFO holds 8 words - 32 bytes. Whatever the state machine pushes
- * while the CPU is busy has to fit there or it is dropped silently, and a hole
- * in the middle of a JPEG shows up as a torn band across the picture. So the
- * per-line work is kept to arming the next transfer and scanning for the end
- * of the image.
- */
-static inline void start_line_dma_to(uint8_t *dst)
-{
-    dma_channel_set_trans_count(camera.dma_channel, camera.line_length / 4, false);
-    dma_channel_set_write_addr(camera.dma_channel, dst, true);
-}
+/* How long VSYNC may take to change, and how long the DMA may go without
+ * moving while VSYNC says the frame is still coming. */
+#define VSYNC_TIMEOUT_US     2000000u
+#define STALL_TIMEOUT_US      500000u
+/* Attempts at a frame that does not start with SOI before giving up. */
+#define SOI_ATTEMPTS               3
 
 void cam_capture_init(void)
 {
@@ -112,248 +104,192 @@ void cam_capture_init(void)
 
     dma_channel_configure(camera.dma_channel, &camera.dma_config,
                           &s_dma_parking, &camera.pio->rxf[camera.pio_sm],
-                          camera.line_length / 4, false);
+                          1, false);
 
     printf("[capture pio_sm=%u dma_ch=%u pio_off=%u D0=GP%d VSYNC=GP%d]\n",
            camera.pio_sm, camera.dma_channel, offset, camera.pin_d0, camera.pin_vsync);
 }
 
-int cam_capture_frame_into(uint8_t *buf, uint32_t cap) {
-    camera.line_num = 0;
-    camera.frame_length = 0;
-    int retry_count = 0;
-    const int max_retries = 3;
-    uint32_t jpeg_end  = 0;     /* byte offset just past the JPEG EOI marker */
-    uint32_t parse_pos = 2;     /* next byte the JPEG parser will look at    */
-    bool     in_scan   = false; /* true once past SOS, i.e. in entropy data  */
-    
-    // Timeout constants
-    const uint32_t VSYNC_TIMEOUT_US = 2000000;  // 2 seconds
-    const uint32_t DMA_TIMEOUT_US = 500000;     // 500ms per line
-    absolute_time_t timeout_start;
-    absolute_time_t profile_start;              // whole-capture profiling
-    absolute_time_t readout_start;
+/* ------------------------------------------------------------ JPEG walk -- */
 
-retry_capture:
-    camera.line_num = 0;
-    camera.frame_length = 0;
-    jpeg_end  = 0;
-    parse_pos = 2;
-    in_scan   = false;
-    profile_start = get_absolute_time();
+/*
+ * Finds the end of a JPEG as its bytes arrive.
+ *
+ * The sensor keeps clocking out filler after the image until VSYNC falls, so
+ * the frame ends at the EOI marker (FF D9), not where the data stops. A plain
+ * search for FF D9 is wrong: the header tables are raw bytes and may contain
+ * that pair. So the header is walked segment by segment using each marker's
+ * length, and only the entropy-coded data after SOS is searched - there the
+ * encoder escapes every data FF as FF 00, so FF D9 can only be the real end.
+ */
+typedef struct {
+    uint32_t pos;       /* next byte to look at */
+    bool     in_scan;   /* past SOS: in entropy-coded data */
+} jpeg_walk_t;
 
-    // Wait for VSYNC to go LOW (with timeout)
-    timeout_start = get_absolute_time();
-    while (gpio_get(camera.pin_vsync) == true) {
-        if (absolute_time_diff_us(timeout_start, get_absolute_time()) > VSYNC_TIMEOUT_US) {
-            printf("[ERR] VSYNC timeout waiting for LOW\n");
-            return -2;
+/* Advance over the first `have` bytes of b. Returns the length of the JPEG
+ * (just past EOI) once found, 0 while more bytes are needed, or -1 if the
+ * header is malformed. */
+static int32_t jpeg_walk(jpeg_walk_t *w, const uint8_t *b, uint32_t have)
+{
+    while (!w->in_scan) {
+        if (w->pos + 4 > have) {
+            return 0;
+        }
+        if (b[w->pos] != 0xFF) {
+            return -1;                      /* a segment must start here */
+        }
+        uint8_t m = b[w->pos + 1];
+        if (m == 0xFF) {                    /* fill byte before a marker */
+            w->pos += 1;
+            continue;
+        }
+        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+            w->pos += 2;                    /* markers without a length */
+            continue;
+        }
+        uint32_t len = ((uint32_t)b[w->pos + 2] << 8) | b[w->pos + 3];
+        if (len < 2) {
+            return -1;
+        }
+        w->pos += 2 + len;
+        w->in_scan = (m == 0xDA);
+    }
+
+    while (w->pos + 2 <= have) {
+        const uint8_t *ff = memchr(b + w->pos, 0xFF, have - w->pos - 1);
+        if (ff == NULL) {
+            w->pos = have - 1;              /* an FF may be the last byte */
+            return 0;
+        }
+        w->pos = (uint32_t)(ff - b);
+        if (b[w->pos + 1] == 0xD9) {
+            return (int32_t)(w->pos + 2);
+        }
+        w->pos += 2;                        /* FF 00, or a restart marker */
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------- capture -- */
+
+/* Bytes the DMA has written into buf so far. WRITE_ADDR moves on as each
+ * write completes, so every byte below it is already in memory. */
+static inline uint32_t dma_written(const uint8_t *buf)
+{
+    uint32_t wa = dma_channel_hw_addr(camera.dma_channel)->write_addr;
+    __dmb();                                /* read the data after the address */
+    return wa - (uint32_t)(uintptr_t)buf;
+}
+
+static bool wait_vsync(bool level, absolute_time_t *t0)
+{
+    *t0 = get_absolute_time();
+    while (gpio_get(camera.pin_vsync) != level) {
+        if (absolute_time_diff_us(*t0, get_absolute_time()) > VSYNC_TIMEOUT_US) {
+            return false;
         }
         tight_loop_contents();
     }
-    
-    /*
-     * Arm the first line while VSYNC is still low.
-     *
-     * The PIO state machine is free-running: it pushes a byte on every PCLK
-     * edge that HREF qualifies. If the FIFO is drained and the DMA armed after
-     * VSYNC rises, the sensor has already emitted the first bytes of the frame
-     * and clearing the FIFO throws them away - which loses the JPEG SOI marker
-     * and sends the capture into a retry.
-     *
-     * During vertical blanking HREF is low, so no data is produced and it is
-     * safe to clear the FIFO and leave the DMA waiting on DREQ.
-     */
-    pio_sm_clear_fifos(camera.pio, camera.pio_sm);
-    start_line_dma_to(buf);
+    return true;
+}
 
-    // Wait for VSYNC to go HIGH (frame start, with timeout)
-    timeout_start = get_absolute_time();
-    while (gpio_get(camera.pin_vsync) == false) {
-        if (absolute_time_diff_us(timeout_start, get_absolute_time()) > VSYNC_TIMEOUT_US) {
+int cam_capture_frame_into(uint8_t *buf, uint32_t cap)
+{
+    absolute_time_t t_start = get_absolute_time();
+    absolute_time_t t;
+
+    camera.frame_length = 0;
+    cap &= ~3u;                             /* whole words only */
+
+    for (int attempt = 0; attempt < SOI_ATTEMPTS; attempt++) {
+        /* Arm during vertical blanking: HREF is low, nothing is pushed, so
+         * emptying the FIFO loses nothing and the first byte of the frame
+         * lands at buf[0]. */
+        if (!wait_vsync(false, &t)) {
+            printf("[ERR] VSYNC timeout waiting for LOW\n");
+            return -2;
+        }
+        pio_sm_clear_fifos(camera.pio, camera.pio_sm);
+        dma_channel_set_trans_count(camera.dma_channel, cap / 4, false);
+        dma_channel_set_write_addr(camera.dma_channel, buf, true);
+
+        if (!wait_vsync(true, &t)) {
             printf("[ERR] VSYNC timeout waiting for HIGH\n");
             dma_channel_abort(camera.dma_channel);
             return -2;
         }
-        tight_loop_contents();
-    }
+        absolute_time_t t_read = t = get_absolute_time();
+        cam_vsync_wait_us = (uint32_t)absolute_time_diff_us(t_start, t_read);
 
-    /* Everything above was waiting for the sensor; pixel readout starts now. */
-    readout_start = get_absolute_time();
-    cam_vsync_wait_us =
-        (uint32_t)absolute_time_diff_us(profile_start, readout_start);
+        jpeg_walk_t w = { .pos = 2, .in_scan = false };
+        uint32_t seen = 0;
+        int32_t  end  = 0;
+        bool     soi_checked = false;
 
-    /*
-     * Capture frame line by line, straight into buf.
-     *
-     * The FIFO is never cleared inside this loop: whatever the state machine
-     * pushed between transfers is real image data and gets picked up by the
-     * next one. Clearing it here would punch a silent hole in the middle of the
-     * JPEG that the SOI check at line 0 cannot catch.
-     */
-    do {
+        for (;;) {
+            bool frame_on = gpio_get(camera.pin_vsync);
+            uint32_t have = dma_written(buf);
 
-        // Wait for DMA completion with timeout
-        timeout_start = get_absolute_time();
-        while (dma_channel_is_busy(camera.dma_channel)) {
-            if (absolute_time_diff_us(timeout_start, get_absolute_time()) > DMA_TIMEOUT_US) {
-                printf("[ERR] DMA timeout on line %d\n", camera.line_num);
-                dma_channel_abort(camera.dma_channel);
-                return -3;
+            if (have != seen) {
+                seen = have;
+                t = get_absolute_time();
             }
-            tight_loop_contents();
-        }
-
-        {
-            uint32_t line_off = camera.line_num * camera.line_length;
-            uint32_t scan_end = line_off + camera.line_length;
-            bool     room     = (scan_end + camera.line_length) <= cap;
-
-            /*
-             * Arm the next line before doing anything else. The state machine
-             * keeps producing while the scan below runs and only 32 bytes fit
-             * in the FIFO, so this has to come first.
-             */
-            if (room) {
-                start_line_dma_to(buf + scan_end);
-            }
-
-            camera.line_num++;
-
-            // Check for JPEG header in first few lines (JPEG mode only)
-            if (line_off == 0) {
+            if (!soi_checked && have >= 4) {
                 if (buf[0] != 0xFF || buf[1] != 0xD8) {
-                    retry_count++;
-                    if (retry_count < max_retries) goto retry_capture;
-                    else goto badframe;
+                    break;                  /* not a frame start: try again */
+                }
+                soi_checked = true;
+            }
+            if (soi_checked) {
+                end = jpeg_walk(&w, buf, have);
+                if (end != 0) {
+                    break;
                 }
             }
-
-            /*
-             * Walk the JPEG to find where it really ends.
-             *
-             * The sensor keeps driving data for the whole active frame period,
-             * long after the image has finished, so without this the capture
-             * reads padding until VSYNC drops - which at 1600x1200 and above
-             * overruns buf and throws the frame away entirely.
-             *
-             * Scanning blindly for FF D9 is not safe: byte stuffing only
-             * applies to entropy-coded data, so a quantisation or Huffman
-             * table payload can contain FF D9 and would truncate the image
-             * mid-header. Walk the marker segments by their length until SOS,
-             * and only then look for the end marker.
-             *
-             * The parser is incremental - parse_pos persists across lines and
-             * each byte is examined once. Inside the entropy data it hunts for
-             * the next 0xFF with memchr rather than a byte loop, because this
-             * runs between DMA transfers and the FIFO only buys 32 bytes of
-             * slack.
-             */
-            while (!jpeg_end) {
-                if (!in_scan) {
-                    uint8_t  marker;
-                    uint32_t seg_len;
-
-                    if (parse_pos + 4 > scan_end) {
-                        break;                      /* need more data */
-                    }
-                    if (buf[parse_pos] != 0xFF) {
-                        parse_pos++;                /* resynchronise */
-                        continue;
-                    }
-                    marker = buf[parse_pos + 1];
-
-                    /* A run of FF bytes is legal padding before a marker. */
-                    if (marker == 0xFF) {
-                        parse_pos++;
-                        continue;
-                    }
-
-                    /* Standalone markers carry no length field. */
-                    if (marker == 0xD8 || marker == 0x01 ||
-                        (marker >= 0xD0 && marker <= 0xD7)) {
-                        parse_pos += 2;
-                        continue;
-                    }
-
-                    seg_len = ((uint32_t)buf[parse_pos + 2] << 8) |
-                               (uint32_t)buf[parse_pos + 3];
-                    if (seg_len < 2) {
-                        break;                      /* malformed - give up */
-                    }
-                    parse_pos += 2 + seg_len;
-                    if (marker == 0xDA) {
-                        in_scan = true;             /* entropy data follows */
-                    }
-                } else {
-                    uint8_t *ff;
-
-                    if (parse_pos + 1 >= scan_end) {
-                        break;                      /* need more data */
-                    }
-
-                    ff = memchr(buf + parse_pos, 0xFF,
-                                scan_end - parse_pos - 1);
-                    if (ff == NULL) {
-                        parse_pos = scan_end - 1;   /* keep the trailing byte */
-                        break;
-                    }
-
-                    parse_pos = (uint32_t)(ff - buf);
-                    if (buf[parse_pos + 1] == 0xD9) {
-                        jpeg_end = parse_pos + 2;
-                        break;
-                    }
-                    parse_pos += 2;                 /* FF 00 stuffing or RSTn */
-                }
-            }
-
-            if (jpeg_end) {
-                break;                  /* frame complete - stop reading padding */
-            }
-
-            /* No room was left for another line: the frame is larger than
-             * the buffer. Not a sensor fault - the caller must not reset the
-             * sensor over it (2026-10-26: UXGA on the LH module reset the
-             * sensor every ten frames and froze the stream). */
-            if(!room) {
+            if (have >= cap) {
+                /* Buffer full without EOI: the frame does not fit. Not a
+                 * sensor fault - the caller must not reset the sensor over it
+                 * (2026-10-26: UXGA on the LH module reset the sensor every
+                 * ten frames and froze the stream). */
                 dma_channel_abort(camera.dma_channel);
                 return -5;
             }
+            if (!frame_on) {
+                /* VSYNC fell. `have` was read after the level, so it already
+                 * holds everything pushed before the frame ended, apart from
+                 * words still in the FIFO: one more pass once it drains. */
+                while (!pio_sm_is_rx_fifo_empty(camera.pio, camera.pio_sm) &&
+                       absolute_time_diff_us(t, get_absolute_time()) < 1000) {
+                    tight_loop_contents();
+                }
+                have = dma_written(buf);
+                if (soi_checked) {
+                    end = jpeg_walk(&w, buf, have);
+                }
+                break;
+            }
+            if (absolute_time_diff_us(t, get_absolute_time()) > STALL_TIMEOUT_US) {
+                printf("[ERR] DMA stalled at %lu bytes\n", (unsigned long)have);
+                dma_channel_abort(camera.dma_channel);
+                return -3;
+            }
         }
 
-    } while(gpio_get(camera.pin_vsync) == true);
+        dma_channel_abort(camera.dma_channel);
+        cam_readout_us = (uint32_t)absolute_time_diff_us(t_read, get_absolute_time());
 
-    /* The last transfer was armed for a line that never arrived. */
-    dma_channel_abort(camera.dma_channel);
-    
-    // Frame capture completed
-
-    camera.frame_length =
-        jpeg_end ? jpeg_end
-                 : (camera.line_num * camera.line_length);
-
-    cam_readout_us =
-        (uint32_t)absolute_time_diff_us(readout_start, get_absolute_time());
-    cam_line_count = camera.line_num;
-    cam_parse_pos  = parse_pos;
-    cam_in_scan    = in_scan ? 1 : 0;
-    cam_jpeg_end   = jpeg_end;
-
-    /*
-     * Without an EOI the image is incomplete - the tail was lost, or it did not
-     * fit in buf. Report it rather than hand a truncated JPEG to the
-     * caller: a decoder that rejects it makes the view blink, which is worse
-     * than skipping the frame.
-     */
-    if (!jpeg_end) {
+        if (!soi_checked) {
+            continue;
+        }
+        if (end > 0) {
+            camera.frame_length = (uint32_t)end;
+            return 0;
+        }
+        /* No EOI: the tail was lost or the header is broken. Report it rather
+         * than hand on a truncated JPEG - a decoder that rejects it makes the
+         * view blink, which is worse than skipping the frame. */
         return -4;
     }
-
-    return 0;
-
-badframe:
-    /* Leave no transfer armed behind; the next capture arms its own. */
-    dma_channel_abort(camera.dma_channel);
     return -1;
 }

@@ -285,9 +285,6 @@ int cam_set_framesize(res_t res)
      */
     sleep_ms(settle_ms < 100 ? 100 : settle_ms);
     ret += qb_apply_clock_div(settle_ms);
-
-    /* JPEG: the DMA chunk size, not a row. */
-    camera.line_length = 512;
 #if CAM_QB_DIAG
     {
         static const char *const nm[] = { "?", "?", "?", "320x240", "?", "640x480", "?",

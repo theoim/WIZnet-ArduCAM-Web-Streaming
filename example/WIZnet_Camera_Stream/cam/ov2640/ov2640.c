@@ -637,15 +637,6 @@ int cam_set_framesize(res_t res)
 
     ov2640_read_clock_div();
 
-    /*
-     * In JPEG there are no lines to speak of - the sensor emits one continuous
-     * entropy-coded stream and the frame ends at its EOI marker, not at a row
-     * boundary. This number is therefore the size of the chunk the DMA collects
-     * at a time, and nothing more. It shares a field with the RAW path, where
-     * it really is a line.
-     */
-    camera.line_length = 512;
-
     return ret;
 }
 
