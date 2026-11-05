@@ -137,6 +137,7 @@ if(CAM_PLAIN_HTTP_DEV AND NOT CAMERA_SENSOR STREQUAL "")
             ${CMAKE_CURRENT_LIST_DIR}/net_load.c
             ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
             ${CMAKE_CURRENT_LIST_DIR}/net/wiz_transport.c
+            ${CMAKE_CURRENT_LIST_DIR}/net/http_server.c
             ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
             ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
             ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
@@ -235,6 +236,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/net_load.c
                 ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
                 ${CMAKE_CURRENT_LIST_DIR}/net/wiz_transport.c
+                ${CMAKE_CURRENT_LIST_DIR}/net/http_server.c
                 ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
                 ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
                 ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
