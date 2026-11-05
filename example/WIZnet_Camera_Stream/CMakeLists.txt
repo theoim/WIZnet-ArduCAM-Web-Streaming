@@ -136,6 +136,7 @@ if(CAM_PLAIN_HTTP_DEV AND NOT CAMERA_SENSOR STREQUAL "")
             ${CMAKE_CURRENT_LIST_DIR}/cam_state.c
             ${CMAKE_CURRENT_LIST_DIR}/net_load.c
             ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
+            ${CMAKE_CURRENT_LIST_DIR}/net/wiz_transport.c
             ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
             ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
             ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
@@ -151,6 +152,7 @@ if(CAM_PLAIN_HTTP_DEV AND NOT CAMERA_SENSOR STREQUAL "")
     target_include_directories(camera_plain_dev PRIVATE
             ${CMAKE_CURRENT_LIST_DIR}
             ${CMAKE_CURRENT_LIST_DIR}/http
+            ${CMAKE_CURRENT_LIST_DIR}/net
             ${CMAKE_CURRENT_LIST_DIR}/cam
             ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
             ${CMAKE_CURRENT_LIST_DIR}/capture
@@ -232,6 +234,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
                 ${CMAKE_CURRENT_LIST_DIR}/cam_state.c
                 ${CMAKE_CURRENT_LIST_DIR}/net_load.c
                 ${CMAKE_CURRENT_LIST_DIR}/server_toe.c
+                ${CMAKE_CURRENT_LIST_DIR}/net/wiz_transport.c
                 ${CMAKE_CURRENT_LIST_DIR}/http/http_req.c
                 ${CMAKE_CURRENT_LIST_DIR}/http/conn.c
                 ${CMAKE_CURRENT_LIST_DIR}/capture/dvp_capture.c
@@ -251,6 +254,7 @@ if(NOT CAMERA_SENSOR STREQUAL "")
         target_include_directories(camera_stream_https PRIVATE
                 ${CMAKE_CURRENT_LIST_DIR}
                 ${CMAKE_CURRENT_LIST_DIR}/http
+                ${CMAKE_CURRENT_LIST_DIR}/net
                 ${CMAKE_CURRENT_LIST_DIR}/cam
                 ${CMAKE_CURRENT_LIST_DIR}/cam/${CAMERA_SENSOR}
                 ${CMAKE_CURRENT_LIST_DIR}/capture

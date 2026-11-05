@@ -24,6 +24,10 @@
  *   parse error, timeout, TLS error, peer FIN/RST, stream takeover, send
  *   failure. It is safe to call twice.
  *
+ * Since 2026-11-05 (split step 1) the sockets, TLS steps, deadlines and
+ * connection diagnostics live in net/wiz_transport.c; this file reaches them
+ * through wt_* calls and the callbacks registered in net_server_init().
+ *
  * What did not change: the MJPEG sender (push_stream_frame), the single-viewer
  * takeover policy, Connection: close on every response, the TLS suites and
  * tickets, and the stream diagnostics.
@@ -34,11 +38,6 @@
 
 #include <stdio.h>
 #include <string.h>
-
-#include "port_common.h"
-#include "wizchip_conf.h"
-#include "wizchip_spi.h"
-#include "socket.h"
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -60,10 +59,8 @@
 #include "tls_server.h"
 #endif
 #include "http_req.h"
-#include "conn.h"
+#include "wiz_transport.h"
 
-#define TCP_CHUNK_MAX       1460        /* one segment worth per send() call    */
-#define SEND_TIMEOUT_MS     2000        /* no progress for this long -> drop    */
 #define STREAM_STALL_MS     5000        /* stream frame: no progress -> drop    */
 /* How long one service of the stream socket may wait for TX space. Returning
  * at the first full buffer left the link idle while the loop went round the
@@ -73,49 +70,12 @@
 #define HTTP_RX_CHUNK       512         /* bytes read per receive call          */
 #define HTTP_RX_PASSES      4           /* receive calls per socket per pass    */
 
-#if _WIZCHIP_ >= W6100
-    #define TCP_SOCK_MODE   Sn_MR_TCP4
-#else
-    #define TCP_SOCK_MODE   Sn_MR_TCP
-#endif
-
-#if CONN_MAX_SOCKETS < HTTP_SOCK_COUNT
-#error "CONN_MAX_SOCKETS must cover HTTP_SOCK_COUNT"
-#endif
-#if defined(STREAM_HTTPS) && CONN_REQ_POOL < TLS_MAX_CONN
-#error "one request context per TLS session: CONN_REQ_POOL < TLS_MAX_CONN"
+#if HTTP_SOCK_COUNT != WT_MAX_CONN
+#error "the transport serves exactly HTTP_SOCK_COUNT sockets"
 #endif
 
 
 /* -------------------------------- Variables ------------------------------- */
-static wiz_NetInfo g_net_info =
-{
-    .mac = NET_MAC_ADDR,
-    .ip  = NET_IP_ADDR,
-    .sn  = NET_SUBNET_MASK,
-    .gw  = NET_GATEWAY,
-    .dns = NET_DNS_ADDR,
-#if _WIZCHIP_ > W5500
-    .lla = {0xfe, 0x80, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x02, 0x08, 0xdc, 0xff,
-            0xfe, 0x57, 0x57, 0x26},
-    .gua = {0},
-    .sn6 = {0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00},
-    .gw6 = {0},
-    .dns6 = {0x20, 0x01, 0x48, 0x60,
-             0x48, 0x60, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x88, 0x88},
-    .ipmode = NETINFO_STATIC_ALL
-#else
-    .dhcp = NETINFO_STATIC
-#endif
-};
-
 static char    g_tx_hdr[256];
 static char    g_json[CAM_STATUS_JSON_MAX];
 
@@ -126,8 +86,7 @@ static char    g_json[CAM_STATUS_JSON_MAX];
  * were split. g_rx is only a staging buffer for one receive call; nothing in
  * it outlives the http_req_feed() that copies it.
  */
-static conn_table_t g_conn;
-static http_req_t   g_req[CONN_REQ_POOL];
+static http_req_t   g_req[WT_MAX_REQUEST_SLOTS];
 static uint8_t      g_rx[HTTP_RX_CHUNK];
 
 /** Per-socket role. A socket becomes STREAM after answering GET /stream. */
@@ -141,7 +100,6 @@ static sock_role_t g_role[HTTP_SOCK_COUNT];
  * stream is open, the loop is not reaching push_stream_frame() at all. */
 uint32_t g_push_calls;
 static int8_t      g_stream_sn = -1;
-static uint32_t    g_quick_close;      /* LAST_ACK/TIME_WAIT closed at once */
 /* What the current stream actually carried, printed when it ends. When the
  * page reopens because it drew nothing for 5 s (r=idle), "last sent N ms ago"
  * says which side stopped: a few ms means the board was still delivering and
@@ -201,105 +159,17 @@ static bool setup_open(void) { return g_setup_until && now64() < g_setup_until; 
 static uint8_t  sock_idx(uint8_t sn) { return (uint8_t)(sn - SOCK_HTTP_BASE); }
 
 /* ------------------------------- TCP helpers ------------------------------- */
-/**
- * Send the whole buffer, chunked to what the WIZnet TX buffer will take.
- *
- * This spins rather than yielding, so a response going out is time the other
- * sockets are not being polled - including their deadlines, which are checked
- * on the next pass. Fine for pages and JSON; the MJPEG stream uses
- * tcp_send_some() instead.
- *
- * @return bytes sent, or negative when the peer stalls or disconnects.
- */
+/* Handlers still speak socket numbers until step 2; these map them onto the
+ * transport's connection index. wt_send_all() spins for TX space (2 s without
+ * progress ends it); wt_send_some() queues what fits and returns. */
 static int32_t tcp_send_all(uint8_t sn, const uint8_t *buf, uint32_t len)
 {
-#if defined(STREAM_HTTPS)
-    /* Same contract, through the TLS record layer: encrypt, frame, then the
-     * same chunked TOE sends underneath (tls_server.c bio_send). */
-    return tls_send_all(sn, buf, len);
-#endif
-    uint32_t        sent = 0;
-    absolute_time_t deadline = make_timeout_time_ms(SEND_TIMEOUT_MS);
-
-    while (sent < len) {
-        uint16_t freesize = 0;
-        uint32_t remain;
-        uint16_t chunk;
-        int32_t  ret;
-
-        if (getSn_SR(sn) != SOCK_ESTABLISHED) {
-            return -1;
-        }
-
-        getsockopt(sn, SO_SENDBUF, &freesize);
-        if (freesize == 0) {
-            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-                return -2;               /* client is not draining */
-            }
-            continue;
-        }
-
-        remain = len - sent;
-        chunk  = (remain > freesize) ? freesize : (uint16_t)remain;
-        if (chunk > TCP_CHUNK_MAX) {
-            chunk = TCP_CHUNK_MAX;
-        }
-
-        ret = send(sn, (uint8_t *)(buf + sent), chunk);
-        if (ret < 0) {
-            return ret;
-        }
-
-        sent    += (uint32_t)ret;
-        deadline = make_timeout_time_ms(SEND_TIMEOUT_MS);
-    }
-
-    return (int32_t)sent;
+    return wt_send_all(sock_idx(sn), buf, len);
 }
 
-/**
- * Queue as much as the socket takes right now and return without waiting.
- *
- * @return bytes queued (0: TX buffer full, or the previous SEND still in
- *         flight - send() answers SOCK_BUSY), negative when the connection is
- *         gone. After a short count, call again with the rest.
- */
 static int32_t tcp_send_some(uint8_t sn, const uint8_t *buf, uint32_t len)
 {
-#if defined(STREAM_HTTPS)
-    return tls_send_some(sn, buf, len);
-#else
-    uint32_t sent = 0;
-
-    while (sent < len) {
-        uint16_t freesize = 0;
-        uint32_t remain;
-        uint16_t chunk;
-        int32_t  ret;
-
-        if (getSn_SR(sn) != SOCK_ESTABLISHED) {
-            return -1;
-        }
-        getsockopt(sn, SO_SENDBUF, &freesize);
-        if (freesize == 0) {
-            break;
-        }
-        remain = len - sent;
-        chunk  = (remain > freesize) ? freesize : (uint16_t)remain;
-        if (chunk > TCP_CHUNK_MAX) {
-            chunk = TCP_CHUNK_MAX;
-        }
-        ret = send(sn, (uint8_t *)(buf + sent), chunk);
-        if (ret < 0) {
-            return ret;
-        }
-        if (ret == 0) {
-            break;
-        }
-        sent += (uint32_t)ret;
-    }
-    return (int32_t)sent;
-#endif
+    return wt_send_some(sock_idx(sn), buf, len);
 }
 
 static int32_t send_response_hdrs(uint8_t sn, const char *status,
@@ -430,36 +300,11 @@ static void release_stream_socket(uint8_t sn)
 }
 
 /* ------------------------------ Connection end ----------------------------- */
-/**
- * The one way a connection ends. Safe to call more than once: only the first
- * call for a connection does the work.
- *
- * disconnect() on a blocking socket waits in the driver until the FIN
- * exchange finishes - bounded only by a 200,000-read spin in the modified
- * ioLibrary, i.e. seconds against a silent peer. The socket is switched to
- * non-blocking just for this call, so disconnect() asks for the FIN and
- * returns; conn's CLOSING deadline then forces close() if the exchange never
- * completes. socket() and close() reset the mode, so the next connection on
- * this socket is blocking again as before.
- */
-static void conn_teardown(uint8_t sn, conn_close_reason_t why)
+/* Close through the transport; on_closed() below then releases the stream.
+ * Idempotent, as before. */
+static void conn_teardown(uint8_t sn, wt_close_reason_t why)
 {
-    uint8_t idx = sock_idx(sn);
-    if (conn_phase(&g_conn, idx) == CONN_FREE) {
-        /* never registered (closed before we looked): register to get the
-           CLOSING deadline; TLS phase takes no request context */
-        conn_on_established(&g_conn, idx, now_ms(), true);
-    }
-    if (!conn_close(&g_conn, idx, now_ms(), why)) {
-        return;                                     /* already closing */
-    }
-    release_stream_socket(sn);
-#if defined(STREAM_HTTPS)
-    tls_close(sn);
-#endif
-    uint8_t nb = SOCK_IO_NONBLOCK;
-    ctlsocket(sn, CS_SET_IOMODE, &nb);
-    disconnect(sn);
+    wt_close(sock_idx(sn), why);
 }
 
 /* --------------------------------- Stream ---------------------------------- */
@@ -507,7 +352,7 @@ static int32_t begin_stream(uint8_t sn, const char *why, size_t why_len,
         stream_summary("  old stream on", old);
         g_role[sock_idx(old)] = SOCK_ROLE_HTTP;
         g_stream_sn = -1;
-        conn_teardown(old, CONN_CLOSE_TAKEOVER);
+        conn_teardown(old, WT_CLOSE_TAKEOVER);
     }
 
     if (tcp_send_all(sn, (const uint8_t *)stream_hdr,
@@ -524,7 +369,7 @@ static int32_t begin_stream(uint8_t sn, const char *why, size_t why_len,
     g_stream_frames = 0;
     g_stream_opened_at = get_absolute_time();
     g_stream_last_sent = g_stream_opened_at;
-    conn_on_stream(&g_conn, sock_idx(sn), now_ms());   /* request context back to the pool */
+    wt_hold(sock_idx(sn));              /* request slot back to the pool */
     if (page_len) {
         printf("Stream opened on socket %u (r=%.*s, page: %.*s)\n", sn,
                (int)why_len, why, (int)page_len, page);
@@ -1142,7 +987,7 @@ static int32_t h_logout(uint8_t sn, const http_req_t *r)
     sess_end(&g_sess, id);
     g_req_sess = NULL;
     if (g_stream_owner == id && g_stream_sn >= 0) {
-        conn_teardown((uint8_t)g_stream_sn, CONN_CLOSE_TAKEOVER);
+        conn_teardown((uint8_t)g_stream_sn, WT_CLOSE_TAKEOVER);
     }
     static const char ok[] = "{\"ok\":true}";
     return send_response_hdrs(sn, "200 OK", "application/json",
@@ -1511,50 +1356,30 @@ static void dispatch(uint8_t sn, const http_req_t *r)
     }
 
     if (rc < 0) {
-        conn_teardown(sn, CONN_CLOSE_SEND);
-    } else if (conn_phase(&g_conn, sock_idx(sn)) != CONN_STREAM) {
-        conn_teardown(sn, CONN_CLOSE_DONE);         /* Connection: close */
+        conn_teardown(sn, WT_CLOSE_SEND);
+    } else if (!wt_is_held(sock_idx(sn))) {
+        conn_teardown(sn, WT_CLOSE_DONE);         /* Connection: close */
     }
 }
 
 /* ------------------------------ Request intake ----------------------------- */
-/* Read what has arrived into this connection's request context. */
-static void serve_request(uint8_t sn)
+/* Transport callback: read what has arrived into this connection's request
+ * context. */
+static void on_readable(void *user, wt_conn_t c, wt_slot_t slot)
 {
-    uint8_t idx = sock_idx(sn);
-    int ri = conn_req(&g_conn, idx);
-    if (ri < 0) {
-        conn_teardown(sn, CONN_CLOSE_POOL);
-        return;
-    }
-    http_req_t *r = &g_req[ri];
+    (void)user;
+    uint8_t     sn = (uint8_t)(SOCK_HTTP_BASE + c);
+    http_req_t *r  = &g_req[slot];
 
     for (int pass = 0; pass < HTTP_RX_PASSES; pass++) {
-        int32_t n;
-#if defined(STREAM_HTTPS)
-        n = tls_recv(sn, g_rx, sizeof(g_rx));
+        int32_t n = wt_recv(c, g_rx, sizeof(g_rx));
         if (n < 0) {
-            conn_teardown(sn, CONN_CLOSE_PEER);     /* close_notify or TLS error */
+            conn_teardown(sn, WT_CLOSE_PEER);       /* FIN/RST, close_notify or TLS error */
             return;
         }
-#else
-        uint16_t avail = 0;
-        getsockopt(sn, SO_RECVBUF, &avail);
-        if (avail == 0) {
-            n = 0;
-        } else {
-            if (avail > sizeof(g_rx)) avail = sizeof(g_rx);
-            n = recv(sn, g_rx, avail);
-            if (n < 0) {
-                conn_teardown(sn, CONN_CLOSE_PEER);
-                return;
-            }
-        }
-#endif
         if (n == 0) {
             return;                                 /* nothing more this pass */
         }
-        conn_on_bytes(&g_conn, idx, now_ms());
 
         size_t used = 0;
         http_req_result_t res = http_req_feed(r, g_rx, (size_t)n, &used);
@@ -1566,7 +1391,7 @@ static void serve_request(uint8_t sn)
             printf("[http] s%u rejected: %d %s\n", sn, st,
                    http_req_err_name(http_req_error(r)));
             send_error(sn, st, NULL);
-            conn_teardown(sn, CONN_CLOSE_PARSE);
+            conn_teardown(sn, WT_CLOSE_PARSE);
             return;
         }
         /* COMPLETE. Anything after the request in g_rx (a pipelined second
@@ -1576,257 +1401,82 @@ static void serve_request(uint8_t sn)
     }
 }
 
-/* ------------------------------ Socket machine ----------------------------- */
-static void socket_run(uint8_t sn)
+/* ---------------------------- Transport callbacks --------------------------- */
+static void on_ready(void *user, wt_conn_t c, wt_slot_t slot)
 {
-    uint8_t  idx = sock_idx(sn);
-    uint8_t  sr  = getSn_SR(sn);
-    uint32_t now = now_ms();
+    (void)user;
+    (void)c;
+    http_req_init(&g_req[slot]);
+}
 
-    /* Deadlines first, whatever the socket state. */
-    conn_action_t act = conn_tick(&g_conn, idx, now);
-    if (act == CONN_ACT_TIMEOUT) {
-        conn_close_reason_t why = conn_timeout_reason(&g_conn, idx);
-        printf("[conn] s%u %s timeout in phase %s\n", sn, conn_reason_name(why),
-               conn_phase_name(conn_phase(&g_conn, idx)));
-        if (conn_phase(&g_conn, idx) == CONN_REQ) {
-            send_error(sn, 408, NULL);              /* best effort, bounded by the send stall */
-        }
-        conn_teardown(sn, why);
-        return;
+static void on_request_timeout(void *user, wt_conn_t c, wt_slot_t slot)
+{
+    (void)user;
+    (void)slot;
+    send_error((uint8_t)(SOCK_HTTP_BASE + c), 408, NULL);
+}
+
+static void on_refused(void *user, wt_conn_t c)
+{
+    (void)user;
+    send_error((uint8_t)(SOCK_HTTP_BASE + c), 503, NULL);
+}
+
+static void on_hold(void *user, wt_conn_t c)
+{
+    (void)user;
+    if (push_stream_frame((uint8_t)(SOCK_HTTP_BASE + c)) < 0) {
+        wt_close(c, WT_CLOSE_SEND);
     }
-    if (act == CONN_ACT_FORCE_CLOSE) {
-        printf("[conn] s%u FIN exchange did not finish in %u ms (SR 0x%02X) - close()\n",
-               sn, (unsigned)CONN_CLOSING_MS, sr);
-        conn_note_forced(&g_conn, idx);
-        close(sn);                                  /* SOCK_CLOSED -> reopened below */
-        sr = getSn_SR(sn);
-    }
+}
 
-    switch (sr) {
-    case SOCK_ESTABLISHED:
-        if (getSn_IR(sn) & Sn_IR_CON) {
-            setSn_IR(sn, Sn_IR_CON);
-        }
-        if (conn_phase(&g_conn, idx) == CONN_CLOSING) {
-            return;                                 /* our FIN is in flight */
-        }
-        if (conn_phase(&g_conn, idx) == CONN_FREE) {
-#if defined(STREAM_HTTPS)
-            conn_on_established(&g_conn, idx, now, true);
-#else
-            if (!conn_on_established(&g_conn, idx, now, false)) {
-                send_error(sn, 503, NULL);
-                conn_teardown(sn, CONN_CLOSE_POOL);
-                return;
-            }
-            http_req_init(&g_req[conn_req(&g_conn, idx)]);
-#endif
-        }
-
-#if defined(STREAM_HTTPS)
-        if (conn_phase(&g_conn, idx) == CONN_TLS) {
-            /* TLS first: nothing below runs until the handshake is done. The
-             * ECDHE step stalls this loop ~130-220 ms for a new client and
-             * ~5 ms for one resuming from a ticket. */
-            if (!tls_active(sn) && !tls_accept(sn)) {
-                conn_teardown(sn, CONN_CLOSE_TLS_REFUSED);
-                return;
-            }
-            int hs = tls_handshake_step(sn);
-            if (hs < 0) {
-                conn_teardown(sn, CONN_CLOSE_TLS);
-                return;
-            }
-            if (hs == 0) {
-                return;
-            }
-            if (!conn_on_tls_ready(&g_conn, idx, now_ms())) {
-                send_error(sn, 503, NULL);
-                conn_teardown(sn, CONN_CLOSE_POOL);
-                return;
-            }
-            http_req_init(&g_req[conn_req(&g_conn, idx)]);
-        }
-#endif
-
-        if (conn_phase(&g_conn, idx) == CONN_STREAM) {
-            if (push_stream_frame(sn) < 0) {
-                conn_teardown(sn, CONN_CLOSE_SEND);
-            }
-            return;
-        }
-        serve_request(sn);
-        return;
-
-    /*
-     * CLOSE_WAIT is the state a browser leaves behind when it closes a tab
-     * without finishing the exchange. Recycling it here rather than waiting is
-     * what keeps a listener from being lost one tab at a time over an
-     * afternoon of visitors.
-     */
-    case SOCK_CLOSE_WAIT:
-        conn_teardown(sn, CONN_CLOSE_PEER);
-        return;
-
-    case SOCK_CLOSED:
-        release_stream_socket(sn);
-#if defined(STREAM_HTTPS)
-        tls_close(sn);                    /* peer reset: free the session */
-#endif
-        conn_on_closed(&g_conn, idx);
-        if (socket(sn, TCP_SOCK_MODE, HTTP_PORT, 0x00) != sn) {
-            printf("Socket %u open failed\n", sn);
-            return;
-        }
-        /* Listen in the same pass, not on the next one: a pass can be held up
-         * hundreds of ms by a login or a handshake on another socket, and a
-         * socket left in INIT meanwhile answers no SYN (2026-10-26). */
-        if (getSn_SR(sn) == SOCK_INIT && listen(sn) != SOCK_OK) {
-            printf("Socket %u listen failed\n", sn);
-        }
-        return;
-
-    case SOCK_INIT:
-        if (listen(sn) != SOCK_OK) {
-            printf("Socket %u listen failed\n", sn);
-        }
-        return;
-
-    /*
-     * LAST_ACK and TIME_WAIT: our FIN is out and the peer's FIN has arrived -
-     * the response was delivered, all that is left is the peer's ACK of our
-     * FIN (or the 2*MSL wait). Close now instead of waiting. Measured
-     * 2026-10-26: back-to-back status polls left seven sockets in LAST_ACK
-     * for ~65 ms at a time with none in LISTEN, and the PC's SYN in that gap
-     * went unanswered until its retry 0.5 s / 1 s later.
-     */
-    case SOCK_LAST_ACK:
-    case SOCK_TIME_WAIT:
-        g_quick_close++;
-        close(sn);
-        release_stream_socket(sn);
-#if defined(STREAM_HTTPS)
-        tls_close(sn);
-#endif
-        conn_on_closed(&g_conn, idx);
-        if (socket(sn, TCP_SOCK_MODE, HTTP_PORT, 0x00) == sn && getSn_SR(sn) == SOCK_INIT) {
-            listen(sn);                   /* back in LISTEN within this pass */
-        }
-        return;
-
-    default:
-        return;                            /* LISTEN / SYNRECV / closing states */
-    }
+static void on_closed(void *user, wt_conn_t c, wt_close_reason_t why)
+{
+    (void)user;
+    (void)why;
+    release_stream_socket((uint8_t)(SOCK_HTTP_BASE + c));
 }
 
 /* --------------------------------- Public ---------------------------------- */
-/*
- * Longest single socket_run() since the last status report: core 0 serves the
- * sockets one after another, so a run that takes long is time every other
- * connection waits - the suspect for status polls that took ~1 s on the LH
- * board (2026-10-26). Reported and reset by each status document; runs over
- * SLOW_LOG_MS are also logged as they happen.
- */
-#ifndef CAM_NET_DIAG
-#define CAM_NET_DIAG 0            /* 1: sample listener starvation (see listen_sample) */
-#endif
-#define SLOW_LOG_MS 300u
-static uint32_t g_slow_us;
-static uint8_t  g_slow_sn, g_slow_role, g_slow_phase;
-static uint32_t g_slow_total;           /* runs over SLOW_LOG_MS since boot */
-
-/*
- * Listener starvation: a client's SYN that finds no socket in LISTEN is not
- * answered, and the PC retries after 0.5 s / 1 s - exactly the connect times
- * of the slow status polls (2026-10-26). Sampled once a millisecond; the
- * longest span with no listener since the last status report, and the socket
- * states when a span starts, are reported.
- */
-static uint32_t g_nolisten_max_ms, g_nolisten_spans;
-static uint32_t g_nolisten_since;       /* ms, 0 = a listener exists */
-static uint32_t g_listen_sample_at;
-
-static void listen_sample(void)
-{
-#if !CAM_NET_DIAG
-    return;                       /* 8 SPI reads a millisecond: diagnostic builds only */
-#endif
-    uint32_t t = now_ms();
-    if (t == g_listen_sample_at) {
-        return;
-    }
-    g_listen_sample_at = t;
-    uint8_t sr[HTTP_SOCK_COUNT];
-    unsigned listening = 0;
-    for (uint8_t i = 0; i < HTTP_SOCK_COUNT; i++) {
-        sr[i] = getSn_SR((uint8_t)(SOCK_HTTP_BASE + i));
-        if (sr[i] == SOCK_LISTEN) listening++;
-    }
-    if (listening) {
-        if (g_nolisten_since) {
-            uint32_t span = t - g_nolisten_since;
-            if (span > g_nolisten_max_ms) g_nolisten_max_ms = span;
-            if (span >= 20u) {
-                printf("[listen] no listener for %lu ms\n", (unsigned long)span);
-            }
-            g_nolisten_since = 0;
-        }
-        return;
-    }
-    if (!g_nolisten_since) {
-        g_nolisten_since = t ? t : 1u;
-        g_nolisten_spans++;
-        printf("[listen] none listening: SR %02X %02X %02X %02X %02X %02X %02X %02X\n",
-               sr[0], sr[1], sr[2], sr[3], sr[4], sr[5], sr[6], sr[7]);
-    }
-}
-
 int net_server_status_json(char *buf, size_t cap)
 {
-    const uint32_t *c = g_conn.closes;
-    uint32_t slow_ms = g_slow_us / 1000u;
-    uint8_t  ssn = g_slow_sn, srole = g_slow_role, sphase = g_slow_phase;
-    uint32_t nl = g_nolisten_max_ms;
-    g_slow_us = 0;
-    g_nolisten_max_ms = 0;
-    return snprintf(buf, cap,
-        "\"slow\":{\"ms\":%lu,\"sn\":%u,\"role\":\"%s\",\"phase\":%u,\"count\":%lu,"
-        "\"nolisten_ms\":%lu,\"nolisten_spans\":%lu,\"quick_close\":%lu},"
-        "\"http\":{\"done\":%lu,\"parse\":%lu,\"to_hs\":%lu,\"to_req\":%lu,"
-        "\"tls_err\":%lu,\"refused\":%lu,\"peer\":%lu,\"takeover\":%lu,"
-        "\"send\":%lu,\"pool\":%lu,\"forced\":%lu,\"req_peak\":%u},",
-        (unsigned long)slow_ms, ssn, srole == SOCK_ROLE_STREAM ? "stream" : "http", sphase,
-        (unsigned long)g_slow_total, (unsigned long)nl, (unsigned long)g_nolisten_spans, (unsigned long)g_quick_close,
-        (unsigned long)c[CONN_CLOSE_DONE], (unsigned long)c[CONN_CLOSE_PARSE],
-        (unsigned long)c[CONN_CLOSE_TIMEOUT_HS], (unsigned long)c[CONN_CLOSE_TIMEOUT_REQ],
-        (unsigned long)c[CONN_CLOSE_TLS], (unsigned long)c[CONN_CLOSE_TLS_REFUSED],
-        (unsigned long)c[CONN_CLOSE_PEER], (unsigned long)c[CONN_CLOSE_TAKEOVER],
-        (unsigned long)c[CONN_CLOSE_SEND], (unsigned long)c[CONN_CLOSE_POOL],
-        (unsigned long)g_conn.forced, (unsigned)g_conn.req_peak);
+    return wt_status_json(buf, cap);
 }
+
+static const wt_config_t g_wt_cfg = {
+    .mac  = NET_MAC_ADDR,
+    .ip   = NET_IP_ADDR,
+    .mask = NET_SUBNET_MASK,
+    .gw   = NET_GATEWAY,
+    .dns  = NET_DNS_ADDR,
+    .port = HTTP_PORT,
+    .first_socket = SOCK_HTTP_BASE,
+#if defined(STREAM_HTTPS)
+    .tls  = true,
+#else
+    .tls  = false,
+#endif
+};
 
 void net_server_init(void)
 {
     uint8_t i;
 
+    static const wt_handlers_t h = {
+        .on_ready           = on_ready,
+        .on_readable        = on_readable,
+        .on_request_timeout = on_request_timeout,
+        .on_refused         = on_refused,
+        .on_hold            = on_hold,
+        .on_closed          = on_closed,
+        .user               = NULL,
+    };
+
     sleep_ms(3000);
 
-    wizchip_spi_initialize();
-    wizchip_cris_initialize();
-    wizchip_reset();
-    wizchip_initialize();
-    wizchip_check();
-
-    network_initialize(g_net_info);
-    print_network_information(g_net_info);
-#if defined(STREAM_HTTPS)
-    if (!tls_server_init()) {
-        printf("[tls] NOT READY - every connection will be refused\n");
+    if (!wt_init(&g_wt_cfg, &h)) {
+        printf("[net] transport init failed - no connections will be served\n");
     }
-#endif
-
-    conn_init(&g_conn);
     for (i = 0; i < HTTP_SOCK_COUNT; i++) {
         g_role[i] = SOCK_ROLE_HTTP;
     }
@@ -1854,14 +1504,14 @@ void net_server_init(void)
 #endif
 
     printf("HTTP camera server ready (" STACK_NAME ", %u listeners, %u request contexts)\n",
-           (unsigned)HTTP_SOCK_COUNT, (unsigned)CONN_REQ_POOL);
+           (unsigned)HTTP_SOCK_COUNT, (unsigned)WT_MAX_REQUEST_SLOTS);
 #if defined(STREAM_HTTPS)
     printf("Open https://%d.%d.%d.%d/ in a browser (trust the demo CA first)\n",
 #else
     printf("Open http://%d.%d.%d.%d/ in a browser\n",
 #endif
-           g_net_info.ip[0], g_net_info.ip[1],
-           g_net_info.ip[2], g_net_info.ip[3]);
+           g_wt_cfg.ip[0], g_wt_cfg.ip[1],
+           g_wt_cfg.ip[2], g_wt_cfg.ip[3]);
 }
 
 #if CAM_AUTH
@@ -1934,7 +1584,7 @@ static void auth_housekeeping(void)
     last = t;
     if (g_stream_owner && g_stream_sn >= 0 && !sess_alive(&g_sess, g_stream_owner, now64())) {
         printf("[auth] session %lu ended - closing its stream\n", (unsigned long)g_stream_owner);
-        conn_teardown((uint8_t)g_stream_sn, CONN_CLOSE_TAKEOVER);
+        conn_teardown((uint8_t)g_stream_sn, WT_CLOSE_TAKEOVER);
     }
     if (g_setup_until && now64() >= g_setup_until) {
         g_setup_until = 0;
@@ -1945,25 +1595,7 @@ static void auth_housekeeping(void)
 
 void net_server_service(void)
 {
-    uint8_t i;
-    for (i = 0; i < HTTP_SOCK_COUNT; i++) {
-        uint8_t  sn    = (uint8_t)(SOCK_HTTP_BASE + i);
-        uint8_t  role  = g_role[i];
-        uint8_t  phase = (uint8_t)conn_phase(&g_conn, i);
-        uint64_t t0    = time_us_64();
-        socket_run(sn);
-        uint32_t d = (uint32_t)(time_us_64() - t0);
-        if (d > g_slow_us) {
-            g_slow_us = d; g_slow_sn = sn; g_slow_role = role; g_slow_phase = phase;
-        }
-        listen_sample();
-        if (d >= SLOW_LOG_MS * 1000u) {
-            g_slow_total++;
-            printf("[slow] s%u %s phase %u: %lu ms\n", sn,
-                   role == SOCK_ROLE_STREAM ? "stream" : "http", phase,
-                   (unsigned long)(d / 1000u));
-        }
-    }
+    wt_service();
 #if CAM_AUTH
     auth_housekeeping();
 #endif
